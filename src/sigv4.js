@@ -499,6 +499,28 @@ function rejectStreaming(request, payloadHash, signedHeaderNames) {
 }
 
 export async function verifyRequest(request, credentials, options = {}) {
+  const url = new URL(request.url)
+  const hasAuthorizationHeader = request.headers.has('authorization')
+  const hasPresignInformation =
+    findCaseInsensitiveParamNames(url.searchParams, [
+      'X-Amz-Algorithm',
+      'X-Amz-Credential',
+      'X-Amz-Date',
+      'X-Amz-Expires',
+      'X-Amz-SignedHeaders',
+      'X-Amz-Signature',
+      'X-Amz-Security-Token',
+    ]).length > 0
+  if (!hasAuthorizationHeader && !hasPresignInformation) {
+    if (options.requireAuthentication) {
+      throw new SigV4Error(
+        'AccessDenied',
+        'A valid SigV4 signature is required.',
+      )
+    }
+    return null
+  }
+
   if (
     typeof credentials?.accessKeyId !== 'string' ||
     typeof credentials?.secretAccessKey !== 'string'
@@ -510,7 +532,6 @@ export async function verifyRequest(request, credentials, options = {}) {
     )
   }
 
-  const url = new URL(request.url)
   const hasAuthorization = request.headers.has('authorization')
   const authParamNames = findCaseInsensitiveParamNames(url.searchParams, [
     'X-Amz-Algorithm',
@@ -733,6 +754,22 @@ export async function verifyRequest(request, credentials, options = {}) {
     payloadHash,
     scope,
   }
+}
+
+export function hasSigV4Information(request) {
+  if (request.headers.has('authorization')) return true
+  const url = new URL(request.url)
+  return (
+    findCaseInsensitiveParamNames(url.searchParams, [
+      'X-Amz-Algorithm',
+      'X-Amz-Credential',
+      'X-Amz-Date',
+      'X-Amz-Expires',
+      'X-Amz-SignedHeaders',
+      'X-Amz-Signature',
+      'X-Amz-Security-Token',
+    ]).length > 0
+  )
 }
 
 function parseLongDate(value) {

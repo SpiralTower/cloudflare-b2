@@ -1,208 +1,211 @@
-//
-// Proxy Backblaze S3 compatible API requests, sending notifications to a webhook
-//
-// Adapted from https://github.com/obezuk/worker-signed-s3-template
-//
-import { AwsClient } from 'aws4fetch'
+import {
+  SigV4Error,
+  hasSigV4Information,
+  signRequest,
+  verifyRequest,
+} from './src/sigv4.js'
+import { RoutingError, routeRequest } from './src/routing.js'
 
-const UNSIGNABLE_HEADERS = [
-    // These headers appear in the request, but are never passed upstream
-    'x-forwarded-proto',
-    'x-real-ip',
-    // We can't include accept-encoding in the signature because Cloudflare
-    // sets the incoming accept-encoding header to "gzip, br", then modifies
-    // the outgoing request to set accept-encoding to "gzip".
-    // Not cool, Cloudflare!
-    'accept-encoding',
-    // Conditional headers are not consistently passed upstream
-    'if-match',
-    'if-modified-since',
-    'if-none-match',
-    'if-range',
-    'if-unmodified-since',
-];
+const XML_HEADERS = {
+  'content-type': 'application/xml; charset=utf-8',
+}
+const SUPPORTED_METHODS = new Set([
+  'GET',
+  'HEAD',
+  'PUT',
+  'POST',
+  'DELETE',
+  'OPTIONS',
+])
+const RANGE_RETRY_ATTEMPTS = 3
+const UNSIGNABLE_HEADERS = new Set([
+  'accept-encoding',
+  'authorization',
+  'cf-connecting-ip',
+  'cf-ipcountry',
+  'cf-ray',
+  'cf-visitor',
+  'connection',
+  'content-length',
+  'host',
+  'if-match',
+  'if-modified-since',
+  'if-none-match',
+  'if-range',
+  'if-unmodified-since',
+  'keep-alive',
+  'proxy-connection',
+  'te',
+  'trailer',
+  'transfer-encoding',
+  'upgrade',
+  'x-forwarded-for',
+  'x-forwarded-proto',
+  'x-real-ip',
+  'x-amz-date',
+])
 
-// URL needs colon suffix on protocol, and port as a string
-const HTTPS_PROTOCOL = "https:";
-const HTTPS_PORT = "443";
-
-// How many times to retry a range request where the response is missing content-range
-const RANGE_RETRY_ATTEMPTS = 3;
-
-// Filter out cf-* and any other headers we don't want to include in the signature
-function filterHeaders(headers, env) {
-    // Suppress irrelevant IntelliJ warning
-    // noinspection JSCheckFunctionSignatures
-    return new Headers(Array.from(headers.entries())
-        .filter(pair => !(
-            UNSIGNABLE_HEADERS.includes(pair[0])
-            || pair[0].startsWith('cf-')
-            || ('ALLOWED_HEADERS' in env && !env['ALLOWED_HEADERS'].includes(pair[0]))
-        ))
-    );
+function escapeXml(value) {
+  return String(value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;')
 }
 
-function createHeadResponse(response) {
-    return new Response(null, {
-        headers: response.headers,
-        status: response.status,
-        statusText: response.statusText
-    });
-}
-
-function isListBucketRequest(env, path) {
-    const pathSegments = path.split('/');
-
-    return (env['BUCKET_NAME'] === "$path" && pathSegments.length < 2) // https://endpoint/bucket-name/
-        || (env['BUCKET_NAME'] !== "$path" && path.length === 0); // https://bucket-name.endpoint/ or https://endpoint/
-}
-
-// Supress IntelliJ's "unused default export" warning
-// noinspection JSUnusedGlobalSymbols
-export default {
-    async fetch(request, env) {
-        // Only allow GET and HEAD methods
-        if (!['GET', 'HEAD'].includes(request.method)){
-            return new Response(null, {
-                status: 405,
-                statusText: "Method Not Allowed"
-            });
-        }
-
-        const url = new URL(request.url);
-
-        // Incoming protocol and port is taken from the worker's environment.
-        // Local dev mode uses plain http on 8787, and it's possible to deploy
-        // a worker on plain http. B2 only supports https on 443
-        url.protocol = HTTPS_PROTOCOL;
-        url.port = HTTPS_PORT;
-
-        // Remove leading slashes from path
-        let path = url.pathname.replace(/^\//, '');
-        // Remove trailing slashes
-        path = path.replace(/\/$/, '');
-
-        // Reject list bucket requests unless configuration allows it
-        if (isListBucketRequest(env, path) && String(env['ALLOW_LIST_BUCKET']) !== "true") {
-            return new Response(null, {
-                status: 404,
-                statusText: "Not Found"
-            });
-        }
-
-        // Set RCLONE_DOWNLOAD to "true" to use rclone with --b2-download-url
-        // See https://rclone.org/b2/#b2-download-url
-        const rcloneDownload = String(env["RCLONE_DOWNLOAD"]) === 'true';
-
-        // Set upstream target hostname.
-        switch (env['BUCKET_NAME']) {
-            case "$path":
-                // Bucket name is initial segment of URL path
-                url.hostname = env['B2_ENDPOINT'];
-                break;
-            case "$host":
-                // Bucket name is initial subdomain of the incoming hostname
-                url.hostname = url.hostname.split('.')[0] + '.' + env['B2_ENDPOINT'];
-                break;
-            default:
-                // Bucket name is specified in the BUCKET_NAME variable
-                url.hostname = env['BUCKET_NAME'] + "." + env['B2_ENDPOINT'];
-                break;
-        }
-
-        // Certain headers, such as x-real-ip, appear in the incoming request but
-        // are removed from the outgoing request. If they are in the outgoing
-        // signed headers, B2 can't validate the signature.
-        const headers = filterHeaders(request.headers, env);
-
-        // Create an S3 API client that can sign the outgoing request
-        const client = new AwsClient({
-            "accessKeyId": env['B2_APPLICATION_KEY_ID'],
-            "secretAccessKey": env['B2_APPLICATION_KEY'],
-            "service": "s3",
-        });
-
-        // Save the request method, so we can process responses for HEAD requests appropriately
-        const requestMethod = request.method;
-
-        if (rcloneDownload) {
-            if (env['BUCKET_NAME'] === "$path") {
-                // Remove leading file/ prefix from the path
-                url.pathname = path.replace(/^file\//, "");
-            } else {
-                // Remove leading file/{bucket_name}/ prefix from the path 
-                url.pathname = path.replace(/^file\/[^/]+\//, "");
-            }            
-        }
-
-        // Sign the outgoing request
-        //
-        // For HEAD requests Cloudflare appears to change the method on the outgoing request to GET (#18), which
-        // breaks the signature, resulting in a 403. So, change all HEADs to GETs. This is not too inefficient,
-        // since we won't read the body of the response if the original request was a HEAD.
-        const signedRequest = await client.sign(url.toString(), {
-            method: 'GET',
-            headers: headers
-        });
-
-        // For large files, Cloudflare will return the entire file, rather than the requested range
-        // So, if there is a range header in the request, check that the response contains the
-        // content-range header. If not, abort the request and try again.
-        // See https://community.cloudflare.com/t/cloudflare-worker-fetch-ignores-byte-request-range-on-initial-request/395047/4
-        if (signedRequest.headers.has("range")) {
-            let attempts = RANGE_RETRY_ATTEMPTS;
-            let response;
-            do {
-                let controller = new AbortController();
-                response = await fetch(signedRequest.url, {
-                    method: signedRequest.method,
-                    headers: signedRequest.headers,
-                    signal: controller.signal,
-                });
-                if (response.headers.has("content-range")) {
-                    // Only log if it didn't work first time
-                    if (attempts < RANGE_RETRY_ATTEMPTS) {
-                        console.log(`Retry for ${signedRequest.url} succeeded - response has content-range header`);
-                    }
-                    // Break out of loop and return the response
-                    break;
-                } else if (response.ok) {
-                    attempts -= 1;
-                    console.error(`Range header in request for ${signedRequest.url} but no content-range header in response. Will retry ${attempts} more times`);
-                    // Do not abort on the last attempt, as we want to return the response
-                    if (attempts > 0) {
-                        controller.abort();
-                    }
-                } else {
-                    // Response is not ok, so don't retry
-                    break;
-                }
-            } while (attempts > 0);
-
-            if (attempts <= 0) {
-                console.error(`Tried range request for ${signedRequest.url} ${RANGE_RETRY_ATTEMPTS} times, but no content-range in response.`);
-            }
-
-            if (requestMethod === 'HEAD') {
-                // Original request was HEAD, so return a new Response without a body
-                return createHeadResponse(response);
-            }
-
-            // Return whatever response we have rather than an error response
-            // This response cannot be aborted, otherwise it will raise an exception
-            return response;
-        }
-
-        // Send the signed request to B2
-        const fetchPromise = fetch(signedRequest);
-
-        if (requestMethod === 'HEAD') {
-            const response = await fetchPromise;
-            // Original request was HEAD, so return a new Response without a body
-            return createHeadResponse(response);
-        }
-
-        // Return the upstream response unchanged
-        return fetchPromise;
+function xmlError(code, message, status = 403) {
+  return new Response(
+    `<?xml version="1.0" encoding="UTF-8"?><Error><Code>${escapeXml(code)}</Code><Message>${escapeXml(message)}</Message></Error>`,
+    {
+      status,
+      headers: XML_HEADERS,
     },
-};
+  )
+}
+
+function errorResponse(error) {
+  if (error instanceof SigV4Error) {
+    return xmlError(error.code, error.message, error.status)
+  }
+  if (error instanceof RoutingError) {
+    return xmlError(
+      error.code,
+      error.message,
+      error.code === 'InvalidRequest' ? 400 : 500,
+    )
+  }
+  console.error(error)
+  return xmlError('InternalError', 'Internal server error', 500)
+}
+
+function filterHeaders(headers, env) {
+  const allowed = env.ALLOWED_HEADERS
+  return new Headers(
+    Array.from(headers.entries()).filter(([name]) => {
+      const lowerName = name.toLowerCase()
+      if (UNSIGNABLE_HEADERS.has(lowerName) || lowerName.startsWith('cf-')) {
+        return false
+      }
+      if (allowed === undefined) return true
+      return allowed.includes(lowerName)
+    }),
+  )
+}
+
+function headResponse(response) {
+  return new Response(null, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: response.headers,
+  })
+}
+
+function isAnonymousReadAllowed(request, env) {
+  return (
+    String(env.ALLOW_UNSIGNED_READ) === 'true' &&
+    ['GET', 'HEAD'].includes(request.method)
+  )
+}
+
+function isHtmlPostPolicy(request) {
+  return (
+    request.method === 'POST' &&
+    String(request.headers.get('content-type') || '')
+      .toLowerCase()
+      .startsWith('multipart/form-data')
+  )
+}
+
+async function fetchWithRangeRetry(upstreamRequest) {
+  if (!upstreamRequest.headers.has('range')) {
+    return fetch(upstreamRequest)
+  }
+
+  let attempts = RANGE_RETRY_ATTEMPTS
+  let response
+  do {
+    const controller = new AbortController()
+    response = await fetch(upstreamRequest, { signal: controller.signal })
+    if (response.headers.has('content-range')) break
+    if (!response.ok) break
+    attempts -= 1
+    if (attempts > 0) controller.abort()
+  } while (attempts > 0)
+  return response
+}
+
+export default {
+  async fetch(request, env) {
+    try {
+      if (!SUPPORTED_METHODS.has(request.method)) {
+        return xmlError(
+          'MethodNotAllowed',
+          'The requested method is not supported.',
+          405,
+        )
+      }
+      if (isHtmlPostPolicy(request)) {
+        return xmlError(
+          'NotImplemented',
+          'HTML POST policy uploads are not supported.',
+          501,
+        )
+      }
+
+      const credentials = {
+        accessKeyId: env.B2_APPLICATION_KEY_ID,
+        secretAccessKey: env.B2_APPLICATION_KEY,
+      }
+      const verificationOptions = {
+        maxSkewSeconds: env.SIGNATURE_MAX_SKEW_SECONDS,
+        requireAuthentication: true,
+      }
+      const anonymousRead = isAnonymousReadAllowed(request, env)
+
+      if (request.method !== 'OPTIONS') {
+        if (anonymousRead) {
+          if (hasSigV4Information(request)) {
+            await verifyRequest(request, credentials, verificationOptions)
+          }
+        } else {
+          await verifyRequest(request, credentials, verificationOptions)
+        }
+      }
+
+      const route = routeRequest(request, env)
+      if (route.isListBucket && String(env.ALLOW_LIST_BUCKET) !== 'true') {
+        return xmlError(
+          'AccessDenied',
+          'Bucket listing is disabled for this deployment.',
+        )
+      }
+      const upstreamMethod = request.method === 'HEAD' ? 'GET' : request.method
+      const payloadHash =
+        request.method === 'HEAD' || request.method === 'OPTIONS'
+          ? 'UNSIGNED-PAYLOAD'
+          : request.headers.get('x-amz-content-sha256') || 'UNSIGNED-PAYLOAD'
+      const signed = await signRequest({
+        method: upstreamMethod,
+        url: route.upstream,
+        headers: filterHeaders(request.headers, env),
+        payloadHash,
+        credentials,
+        region: route.region,
+      })
+      const upstreamRequest = new Request(route.upstream, {
+        method: upstreamMethod,
+        headers: signed.headers,
+        body:
+          upstreamMethod === 'GET' || upstreamMethod === 'HEAD'
+            ? undefined
+            : request.body,
+        redirect: 'manual',
+      })
+      const response = await fetchWithRangeRetry(upstreamRequest)
+      return request.method === 'HEAD' ? headResponse(response) : response
+    } catch (error) {
+      return errorResponse(error)
+    }
+  },
+}
