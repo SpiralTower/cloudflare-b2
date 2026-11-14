@@ -1,176 +1,252 @@
 # Cloudflare Worker for Backblaze B2
 
-Provide access to one or more private [Backblaze B2](https://www.backblaze.com/b2/cloud-storage.html) buckets via a [Cloudflare Worker](https://developers.cloudflare.com/workers/), so that objects in the bucket may only be publicly accessed via Cloudflare. The worker must be configured with a Backblaze application key with access to the buckets you wish to expose.
+English | [简体中文](README.zh-CN.md)
 
-Informal testing suggests that there is negligible performance overhead imposed by signing the request.
+Use a [Cloudflare Worker](https://developers.cloudflare.com/workers/) as a
+private [Backblaze B2](https://www.backblaze.com/b2/cloud-storage.html) S3
+endpoint. Clients sign requests for the CDN hostname with a Backblaze
+application key. The Worker verifies that signature, maps the request to the
+B2 S3 hostname, signs it again with the same key, and forwards it to B2.
 
-## Download the Source Code
+The Worker supports S3 REST requests for `GET`, `HEAD`, `PUT`, `POST`,
+`DELETE`, and `OPTIONS`, including path-style, host-style, multipart REST,
+and presigned URL requests. HTML POST policy form uploads, AWS streaming
+chunk/trailer signing, SigV4a, and session tokens are not supported.
 
-```shell
+## Requirements
+
+- Node.js 22 or newer
+- A private B2 bucket and an application key that can access it
+- A Cloudflare Custom Domain or Route that points your CDN hostname to the
+  Worker
+
+```sh
 git clone git@github.com:backblaze-b2-samples/cloudflare-b2.git
 cd cloudflare-b2
-```
-
-You must also install dependencies before you can deploy or publish the worker:
-
-```shell
-node --version # v22 or later
 npm install
 ```
 
-## Worker Configuration
+## Configuration
 
-Open `wrangler.toml` and configure `B2_APPLICATION_KEY_ID`, `B2_ENDPOINT` and `BUCKET_NAME`. You may also configure `ALLOWED_HEADERS` to restrict the set of headers that will be signed and included in the upstream request to Backblaze B2, and `RCLONE_DOWNLOAD` to use the worker with rclone's `--b2-download-url` option.
+Configure `wrangler.toml` and store `B2_APPLICATION_KEY` as a Worker secret:
 
 ```toml
 [vars]
 B2_APPLICATION_KEY_ID = "<your b2 application key id>"
-B2_ENDPOINT = "<your S3 endpoint - e.g. s3.us-west-001.backblazeb2.com >"
-# Set BUCKET_NAME to:
-#   "A Backblaze B2 bucket name" - direct all requests to the specified bucket
-#   "$path" - use the initial segment in the incoming URL path as the bucket name
-#           e.g. https://images.example.com/bucket-name/path/to/object.png
-#   "$host" - use the initial subdomain in the hostname as the bucket name
-#           e.g. https://bucket-name.images.example.com/path/to/object.png
-BUCKET_NAME = "$path"
-# Backblaze B2 buckets with public-read visibility do not allow anonymous clients
-# to list the bucket’s objects. You can allow or deny this functionality in the
-# Worker via ALLOW_LIST_BUCKET
-ALLOW_LIST_BUCKET = "<true, if you want to allow clients to list objects, otherwise false>"
-# If set, the worker will strip the `file/` prefix from incoming request paths.
-# See https://rclone.org/b2/#b2-download-url
-RCLONE_DOWNLOAD = "<true, if you are using the Worker to proxy downloads for rclone, otherwise false>"
-# If set, these headers will be included in the signed upstream request
-# alongside the minimal set of headers required for an AWS v4 signature:
-# "authorization", "x-amz-content-sha256" and "x-amz-date".
-#
-# Note that, if "x-amz-content-sha256" is not included in ALLOWED_HEADERS, then
-# any value supplied in the incoming request is discarded and
-# "x-amz-content-sha256" will be set to "UNSIGNED-PAYLOAD".
-#
-# If you set ALLOWED_HEADERS, it is your responsibility to ensure that the
-# list of headers that you specify supports the functionality that your client
-# apps use, for example, "range". The list below is a suggested starting point.
-#
-# Note that HTTP headers are not case-sensitive. "host" will match "host",
-# "Host" and "HOST".
-#ALLOWED_HEADERS = [
-#    "content-type",
-#    "date",
-#    "host",
-#    "if-match",
-#    "if-modified-since",
-#    "if-none-match",
-#    "if-unmodified-since",
-#    "range",
-#    "x-amz-content-sha256",
-#    "x-amz-date",
-#    "x-amz-server-side-encryption-customer-algorithm",
-#    "x-amz-server-side-encryption-customer-key",
-#    "x-amz-server-side-encryption-customer-key-md5"
-#]
+B2_ENDPOINT = "s3.us-west-001.backblazeb2.com"
+BUCKET_NAME = "<bucket name, $path, or $host>"
+ALLOW_LIST_BUCKET = "false"
+ALLOW_UNSIGNED_READ = "false"
+SIGNATURE_MAX_SKEW_SECONDS = "900"
+RCLONE_DOWNLOAD = "false"
 ```
 
-You must also configure `B2_APPLICATION_KEY` as a [secret](https://blog.cloudflare.com/workers-secrets-environment/):
-
-```bash
-echo "<your b2 application key>" | wrangler secret put B2_APPLICATION_KEY
+```sh
+printf '%s' '<your b2 application key>' | npx wrangler secret put B2_APPLICATION_KEY
 ```
 
-### Running in Wrangler's Local Server
+| Variable                     | Default         | Purpose                                                                                                                                                              |
+| ---------------------------- | --------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `B2_APPLICATION_KEY_ID`      | required        | B2 application key ID used to verify and re-sign requests.                                                                                                           |
+| `B2_APPLICATION_KEY`         | required secret | B2 application key.                                                                                                                                                  |
+| `B2_ENDPOINT`                | required        | Standard B2 S3 endpoint, such as `s3.us-west-001.backblazeb2.com`. The region is derived from it. Non-standard endpoints fail closed.                                |
+| `BUCKET_NAME`                | required        | A fixed bucket name, `$path`, or `$host`.                                                                                                                            |
+| `ALLOW_LIST_BUCKET`          | `false`         | Allows bucket listing (`GET` or `HEAD` at the bucket root) after authentication.                                                                                     |
+| `ALLOW_UNSIGNED_READ`        | `false`         | Allows fully unsigned `GET` and `HEAD`, including `Range`. Anonymous writes are always denied.                                                                       |
+| `SIGNATURE_MAX_SKEW_SECONDS` | `900`           | Allowed clock skew for Authorization-header signatures, from `0` to `86400`. Invalid values fall back to `900`. Presigned URLs use stricter issue and expiry checks. |
+| `RCLONE_DOWNLOAD`            | `false`         | Strips the rclone `file/` prefix before forwarding, while verifying the signature against the original CDN URL.                                                      |
+| `ALLOWED_HEADERS`            | unset           | If set, only the listed client headers are forwarded upstream. Header names are case-insensitive.                                                                    |
 
-Wrangler's local server loads configuration from `wrangler.toml`, but cannot access secrets. Instead, the local server
-loads additional configuration from `.dev.vars`.
+`ALLOW_LIST_BUCKET` and `ALLOW_UNSIGNED_READ` are independent. An unsigned
+bucket listing still requires both `ALLOW_UNSIGNED_READ=true` and
+`ALLOW_LIST_BUCKET=true`.
 
-Copy `.dev.vars.template` to `.dev.vars` and configure `B2_APPLICATION_KEY`:
+### Local development
 
-````toml
-# Configuration for running the app in local dev mode
-B2_APPLICATION_KEY = "<your b2 application key>"
-````
+Copy `.dev.vars.template` to `.dev.vars` and fill in the application key.
+Wrangler uses `.dev.vars` for local secrets. Then run:
 
-### Passing the Bucket Name
-
-Set `BUCKET_NAME` to:
-
-* A Backblaze B2 bucket name, such as `my-bucket`, to direct all incoming requests to the specified bucket.
-* `$path` to use the initial segment in the incoming URL path as the bucket name, e.g. `https://my.domain.com/my-bucket/path/to/file.png`
-* `$host` to use the initial subdomain in the incoming URL hostname as the bucket name, e.g. `https://my-bucket.my.domain.com/path/to/file.png`
-
-If you are using the default `*.workers.dev` subdomain, you must either specify a bucket name in the configuration, or set `BUCKET_NAME` to `$path` and pass the bucket name in the path.
-
-Note that, if you use the `$host` configuration, you must configure a [Route](https://developers.cloudflare.com/workers/platform/triggers/routes) or a [Custom Domain](https://developers.cloudflare.com/workers/platform/triggers/custom-domains/) for each bucket name. You **cannot** simply route `*.my.domain.com/*` to your worker. 
-
-### Restricting Signed HTTP Headers in the Upstream Request
-
-By default, all HTTP headers in the downstream request from the client are signed and included in the upstream request to Backblaze B2, except the following:
-
-* Cloudflare headers with the prefix `cf-`, plus `x-forwarded-proto` and `x-real-ip`: these are set in the downstream request by Cloudflare, rather than by the client. In addition, `x-real-ip` is removed from the upstream request.
-* `accept-encoding`: No matter what the client passes, Cloudflare sets `accept-encoding` in the incoming request to `gzip, br` and then modifies the outgoing request, setting `accept-encoding` to `gzip`. This breaks the AWS v4 signature.
-* Conditional headers such as `if-match` and `if-modified-since` may be sent by the client but Cloudflare does not forward them in the upstream request if it does not have the resource in its cache, since Cloudflare needs the resource unconditionally.
-
-If you wish to further restrict the set of headers that will be signed and included, you can configure `ALLOWED_HEADERS` in `wrangler.toml`. If `ALLOWED_HEADERS` is set, then  the listed headers will be included in the signed upstream request alongside the minimal set of headers required for an AWS v4 signature: `authorization`, `x-amz-content-sha256` and `x-amz-date`.
-
-Note that, if `x-amz-content-sha256` is not included in `ALLOWED_HEADERS`, then any value supplied in the incoming request will be discarded and `x-amz-content-sha256` will be set to `UNSIGNED-PAYLOAD` in the outgoing request.
-
-If you do set `ALLOWED_HEADERS`, it is your responsibility to ensure that the list of headers that you specify supports the functionality that your client apps use, for example, `range` for [HTTP range requests](https://developer.mozilla.org/en-US/docs/Web/HTTP/Range_requests). The list below, the HTTP headers listed in the [AWS S3 GetObject documentation](https://docs.aws.amazon.com/AmazonS3/latest/API/API_GetObject.html) currently supported by Backblaze B2, is a suggested starting point:
-
+```sh
+npx wrangler dev
 ```
+
+### Bucket modes
+
+- Fixed bucket: `BUCKET_NAME="my-bucket"` maps
+  `https://cdn.example.com/path/to/object` to
+  `https://my-bucket.s3.us-west-001.backblazeb2.com/path/to/object`.
+- `$path`: `BUCKET_NAME="$path"` maps
+  `https://cdn.example.com/my-bucket/path/to/object` to
+  `https://s3.us-west-001.backblazeb2.com/my-bucket/path/to/object`.
+- `$host`: `BUCKET_NAME="$host"` maps
+  `https://my-bucket.cdn.example.com/path/to/object` to
+  `https://my-bucket.s3.us-west-001.backblazeb2.com/path/to/object`.
+
+The `$host` mode needs a Route or Custom Domain for each bucket hostname.
+Wildcard routing alone is not sufficient.
+
+## Client signing
+
+Use the CDN hostname as the S3 endpoint. Sign the exact CDN URL, method,
+query, and signed headers that you send to the Worker:
+
+```sh
+export AWS_ACCESS_KEY_ID='<your b2 application key id>'
+export AWS_SECRET_ACCESS_KEY='<your b2 application key>'
+export AWS_REGION='us-west-001'
+
+aws s3 cp --endpoint-url https://cdn.example.com local.txt \
+  s3://my-bucket/path/to/local.txt
+```
+
+The Worker checks the Authorization header against the CDN request, then
+removes it and creates a new signature for the B2 hostname with a current
+timestamp. `Authorization`-header requests must include
+`x-amz-content-sha256` with either `UNSIGNED-PAYLOAD` or a 64-character
+SHA-256 hex digest. B2 validates the body against that value.
+
+Install the AWS CLI, SDK, or another S3 client with SigV4 support. The CDN
+hostname is a custom endpoint, so use path-style requests unless your CDN
+routing supports bucket subdomains. `$path` mode uses path-style routing.
+
+### Presigned URLs
+
+Presigned URLs must be generated directly against the CDN URL. Do not sign a
+B2 URL and then replace its hostname with the CDN hostname: the host is part
+of the signature and verification will fail.
+
+```python
+import boto3
+
+client = boto3.client(
+    "s3",
+    endpoint_url="https://cdn.example.com",
+    region_name="us-west-001",
+    aws_access_key_id="<your b2 application key id>",
+    aws_secret_access_key="<your b2 application key>",
+    config=boto3.session.Config(s3={"addressing_style": "path"}),
+)
+url = client.generate_presigned_url(
+    "get_object",
+    Params={"Bucket": "my-bucket", "Key": "path/to/object"},
+    ExpiresIn=3600,
+)
+```
+
+Presigned URLs are accepted for `1` through `604800` seconds. Expired,
+future-issued, over-seven-day, duplicate, and security-token URLs are
+rejected. The Worker re-signs presigned requests with
+`UNSIGNED-PAYLOAD` and an Authorization header before forwarding.
+
+## Request behavior
+
+- The exact CDN Host and URI are verified. Authentication query parameters
+  are removed from the forwarded URL, while normal query parameters retain
+  their original order and duplicates.
+- `OPTIONS` bypasses authentication and is forwarded to B2 so the bucket's
+  CORS policy controls the response.
+- `multipart/form-data` POST policy uploads return `NotImplemented`. Other S3
+  REST `POST` operations are forwarded after authentication.
+- Request bodies are streamed from the client without buffering or tee-ing.
+- `x-amz-checksum-*`, `content-md5`, and integrity headers that were signed by
+  the client are retained and signed again for B2.
+- `HEAD` is verified as `HEAD` on the CDN URL, re-signed as `GET` upstream,
+  and returned without a body.
+- A `Range` response missing `Content-Range` is retried up to three times.
+  Redirects are not followed.
+- B2 responses are returned unchanged; the Worker does not add cache headers.
+
+## Allowed headers
+
+By default, client headers are forwarded except authentication/framing
+headers, hop-by-hop headers, Cloudflare-injected headers, the `cf-*` prefix,
+`accept-encoding`, and conditional headers (`if-match`,
+`if-modified-since`, `if-none-match`, `if-range`, `if-unmodified-since`).
+The Worker also removes the client's old `Authorization`, `Host`, and
+`x-amz-date` before signing the B2 request.
+
+To restrict forwarding further, set a list:
+
+```toml
 ALLOWED_HEADERS = [
-    "content-type",
-    "date",
-    "host",
-    "range",
-    "x-amz-content-sha256",
-    "x-amz-date",
-    "x-amz-server-side-encryption-customer-algorithm",
-    "x-amz-server-side-encryption-customer-key",
-    "x-amz-server-side-encryption-customer-key-md5"
+  "content-type",
+  "range",
+  "x-amz-checksum-sha256",
+  "x-amz-server-side-encryption-customer-algorithm",
+  "x-amz-server-side-encryption-customer-key",
+  "x-amz-server-side-encryption-customer-key-md5",
 ]
 ```
 
-Note that HTTP headers are not case-sensitive. `host` will match `host`, `Host` and `HOST`.
+Use the full list of headers that your clients sign and need upstream. A
+missing header can change the behavior of S3 requests or break signature
+verification. Header names are case-insensitive.
 
-## Rclone Custom Endpoint for Downloads
+## Multipart uploads
 
-[Rclone's B2 integration](https://rclone.org/b2/) includes an option to specify a custom endpoint for downloads: [`--b2-download-url`](https://rclone.org/b2/#b2-download-url). Given such a custom endpoint, rather than reading files directly via the B2 Native API, Rclone reads them from that endpoint.
+S3 multipart REST operations, including `CreateMultipartUpload`,
+`UploadPart`, `CompleteMultipartUpload`, `AbortMultipartUpload`, and
+`ListParts`, work through the normal signed request flow. HTML POST policy
+uploads do not work.
 
-If you wish to use the Rclone custom endpoint feature with this Worker, you must set the `RCLONE_DOWNLOAD` environment variable to `true` in `wrangler.toml` or the Cloudflare Dashboard:
+## Rclone downloads
+
+Rclone can use the Worker as a
+[`--b2-download-url`](https://rclone.org/b2/#b2-download-url):
 
 ```toml
 RCLONE_DOWNLOAD = "true"
 ```
 
-Rclone assumes that the Cloudflare endpoint is proxying the B2 Native API, which supports "friendly" download URLs of the form `https://f000.backblazeb2.com/file/bucket-name/path/to/file.txt`. So, given the custom endpoint `https://mysubdomain.mydomain.tld`, Rclone requests a URL such as `https://mysubdomain.mydomain.tld/file/bucket-name/path/to/file.txt`.
+Rclone requests friendly URLs such as
+`https://cdn.example.com/file/my-bucket/path/to/file.txt`. The Worker
+removes the `file/<bucket>/` prefix for the upstream path but verifies the
+signature against the exact CDN URL that Rclone sent.
 
-## Bucket Configuration
+## Bucket caching
 
-Since the bucket is private, the Cloudflare Worker signs each request to Backblaze B2 using the application key, and includes the signature in the request’s `Authorization` HTTP header. By default, [Cloudflare does not cache content](https://developers.cloudflare.com/cache/concepts/cache-control/#conditions) where the request contains the `Authorization` header, so you must set your bucket’s info to include a cache-control directive.
+The Worker signs every B2 request. Configure a cache-control directive in B2
+Bucket Info so Cloudflare can cache objects according to your policy:
 
-* Sign in to your Backblaze account.
-* In the left navigation menu under B2 Cloud Storage, click **Buckets**.
-* Locate your bucket in the list and click **Bucket Settings**.
-* Set **Bucket Info** to `{"Cache-Control":"public"}`. If you wish, you can set additional [cache-control directives](https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Cache-Control#directives), for example, to direct Cloudflare to cache each file for a day, you would set **Bucket Info** to `{"Cache-Control": "public, max-age=86400"}`.
-* Click **Update Bucket**.
-
-## Wrangler
-
-Ensure you are using the latest version of [`wrangler`](https://developers.cloudflare.com/workers/wrangler/), since several commands have been replaced between versions.
-
-You can use this repository as a template for your own worker using [Cloudflare's C3 CLI](https://developers.cloudflare.com/pages/get-started/c3/):
-
-```bash
-npm create cloudflare@latest -- --template https://github.com/backblaze-b2-samples/cloudflare-b2 --deploy false projectname
+```json
+{ "Cache-Control": "public, max-age=86400" }
 ```
 
-If you wish to create a GitHub repository for your worker, it's best to do so now, before you make any changes.
+The Worker does not modify B2 response headers or cache rules. Cloudflare
+may also cache private responses only when your cache rules allow them; do
+not configure a shared cache for responses that must remain private.
 
-Note that you must run `npm install` before you deploy the worker to Cloudflare. Once you have done so, you can run `npx wrangler deploy`.
+## Migration from 1.2
 
-## Range Requests
+Version 1.3 verifies client signatures instead of only signing upstream
+requests. Deployments that relied on anonymous reads must explicitly set
+`ALLOW_UNSIGNED_READ="true"`. All other deployments should sign requests
+against the CDN hostname and may need to allow the headers their client
+uses.
 
-When the worker forwards a range request for a large file (bigger than about 2 GB), Cloudflare may return the entire file, rather than the requested range. The worker includes logic adapted from [this Cloudflare Community reply](https://community.cloudflare.com/t/cloudflare-worker-fetch-ignores-byte-request-range-on-initial-request/395047/4) by [julian.cox](https://community.cloudflare.com/u/julian.cox) to abort and retry the request if the response to a range request does not contain the content-range header. 
+The Worker's default `fetch(request, env, ctx)` export is unchanged.
+
+## Development and tests
+
+```sh
+npm test
+npx prettier --check '**/*.{js,css,json,md}'
+npx wrangler deploy --dry-run
+```
+
+No real B2 bucket is needed for the test suite. The tests run in the Worker
+runtime with fixed AWS SDK and standard SigV4 fixtures.
+
+## Deployment
+
+```sh
+npx wrangler deploy
+```
+
+The GitHub workflow runs tests, formatting checks, and a Wrangler dry run on
+pushes to `main`.
 
 ## Acknowledgements
 
-Based on [https://github.com/obezuk/worker-signed-s3-template](https://github.com/obezuk/worker-signed-s3-template)
+Adapted from
+[worker-signed-s3-template](https://github.com/obezuk/worker-signed-s3-template).

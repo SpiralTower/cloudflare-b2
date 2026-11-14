@@ -1,2 +1,9 @@
 # Configuration for running the app in local dev mode
 B2_APPLICATION_KEY = "<your b2 application key>"
+B2_APPLICATION_KEY_ID = "<your b2 application key id>"
+B2_ENDPOINT = "s3.us-west-001.backblazeb2.com"
+BUCKET_NAME = "<your bucket name, $path, or $host>"
+ALLOW_LIST_BUCKET = "false"
+ALLOW_UNSIGNED_READ = "false"
+SIGNATURE_MAX_SKEW_SECONDS = "900"
+RCLONE_DOWNLOAD = "false"
