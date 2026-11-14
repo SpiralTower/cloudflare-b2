@@ -3,9 +3,14 @@
   "name": "cloudflare-b2",
   "version": "1.2.0",
   "description": "Provide access to a private Backblaze B2 bucket via a Cloudflare Worker",
+  "type": "module",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "check": "npm test && npm run format:check && npm run deploy:dry-run",
+    "format:check": "prettier --check '**/*.{js,css,json,md}'",
+    "deploy:dry-run": "wrangler deploy --dry-run",
     "format": "prettier --write '**/*.{js,css,json,md}'"
   },
   "author": "Pat Patterson <pat@backblaze.com>",
@@ -14,7 +19,16 @@
     "node": ">=22"
   },
   "devDependencies": {
+    "@aws-crypto/sha256-js": "^5.2.0",
+    "@aws-sdk/client-s3": "^3.1169.0",
+    "@aws-sdk/s3-request-presigner": "^3.1169.0",
+    "@cloudflare/vitest-plugin": "^1.8.2",
+    "@msw/cloudflare": "^0.2.0",
+    "@smithy/protocol-http": "^5.6.2",
+    "@smithy/signature-v4": "^5.7.5",
+    "msw": "^3.0.5",
     "prettier": "^3.7.4",
+    "vitest": "^4.1.0",
     "wrangler": "^4.123.0"
   },
   "dependencies": {
