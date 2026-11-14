@@ -94,6 +94,13 @@ function signedDateRequest() {
   })
 }
 
+function encodeQueryComponent(value) {
+  return encodeURIComponent(value).replace(
+    /[!'()*]/g,
+    (character) => `%${character.charCodeAt(0).toString(16).toUpperCase()}`,
+  )
+}
+
 describe('SigV4 verification', () => {
   it('canonicalizes repeated keys and empty query values', () => {
     expect(canonicalizeQuery(parseRawQuery('b=2&a=1&a=0&empty=&bare'))).toBe(
@@ -122,6 +129,108 @@ describe('SigV4 verification', () => {
 
     expect(result.kind).toBe('presigned')
   })
+
+  it.each([
+    ['repeated and empty values', { a: ['1', '0'], empty: '', bare: '' }],
+    [
+      'encoded spaces and plus signs',
+      { space: ['a b', 'a+b'], plus: ['+', '%2B'] },
+    ],
+  ])('verifies an AWS SDK presigned request with %s', async (_label, query) => {
+    const signer = new SignatureV4({
+      credentials,
+      region: 'us-east-1',
+      service: 's3',
+      sha256: Sha256,
+      uriEscapePath: false,
+    })
+    const signed = await signer.presign(
+      new HttpRequest({
+        protocol: 'https:',
+        hostname: 'cdn.example.com',
+        method: 'GET',
+        path: '/bucket/test.txt',
+        query,
+        headers: {
+          host: 'cdn.example.com',
+          'x-amz-content-sha256': 'UNSIGNED-PAYLOAD',
+        },
+      }),
+      {
+        signingDate: new Date('2026-11-15T02:00:00Z'),
+        expiresIn: 3600,
+      },
+    )
+    const search = Object.entries(signed.query)
+      .flatMap(([name, value]) =>
+        (Array.isArray(value) ? value : [value]).map(
+          (item) =>
+            `${encodeQueryComponent(name)}=${encodeQueryComponent(item)}`,
+        ),
+      )
+      .join('&')
+    const url = `https://cdn.example.com/bucket/test.txt?${search}`
+
+    await expect(
+      verifyRequest(new Request(url), credentials, {
+        now: new Date('2026-11-15T02:00:00Z'),
+      }),
+    ).resolves.toMatchObject({ kind: 'presigned' })
+  })
+
+  it.each([
+    {
+      query: { a: ['1', '0'], empty: '', bare: '' },
+      search: '?a=1&a=0&empty=&bare=',
+    },
+    {
+      query: { space: ['a b', 'a+b'], plus: ['+', '%2B'] },
+      search: '?space=a%20b&space=a%2Bb&plus=%2B&plus=%252B',
+    },
+  ])(
+    'verifies an AWS SDK Authorization request with $search',
+    async ({ query, search }) => {
+      const signer = new SignatureV4({
+        credentials,
+        region: 'us-east-1',
+        service: 's3',
+        sha256: Sha256,
+        uriEscapePath: false,
+      })
+      const signed = await signer.sign(
+        new HttpRequest({
+          protocol: 'https:',
+          hostname: 'cdn.example.com',
+          method: 'GET',
+          path: '/bucket/test.txt',
+          query,
+          headers: {
+            host: 'cdn.example.com',
+            'x-amz-content-sha256': 'UNSIGNED-PAYLOAD',
+          },
+        }),
+        {
+          signingDate: new Date('2026-11-15T02:00:00Z'),
+          unsignableHeaders: new Set([
+            'authorization',
+            'x-amz-date',
+            'x-amz-content-sha256',
+          ]),
+          signableHeaders: new Set(),
+        },
+      )
+      const request = new Request(
+        `https://cdn.example.com/bucket/test.txt${search}`,
+        { headers: signed.headers },
+      )
+
+      await expect(
+        verifyRequest(request, credentials, {
+          now: new Date('2026-11-15T02:00:00Z'),
+        }),
+      ).resolves.toMatchObject({ kind: 'authorization' })
+    },
+  )
 
   it.each([
     ['space', 'folder/a b.txt'],
