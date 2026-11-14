@@ -4,7 +4,11 @@ import { SignatureV4 } from '@smithy/signature-v4'
 import { HttpRequest } from '@smithy/protocol-http'
 import { Sha256 } from '@aws-crypto/sha256-js'
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner'
-import { verifyRequest } from '../src/sigv4.js'
+import {
+  canonicalizeQuery,
+  parseRawQuery,
+  verifyRequest,
+} from '../src/sigv4.js'
 
 const credentials = {
   accessKeyId: 'AKIAIOSFODNN7EXAMPLE',
@@ -91,6 +95,12 @@ function signedDateRequest() {
 }
 
 describe('SigV4 verification', () => {
+  it('canonicalizes repeated keys and empty query values', () => {
+    expect(canonicalizeQuery(parseRawQuery('b=2&a=1&a=0&empty=&bare'))).toBe(
+      'a=0&a=1&b=2&bare=&empty=',
+    )
+  })
+
   it('verifies the AWS S3 documented SigV4 presigned GET vector', async () => {
     const request = new Request(
       'https://examplebucket.s3.amazonaws.com/test.txt?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20130524%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20130524T000000Z&X-Amz-Expires=86400&X-Amz-SignedHeaders=host&X-Amz-Signature=aeeed9bbccd4d02ee5c0109b86d86835f995330da4c265957d157751f604d404',
@@ -171,6 +181,37 @@ describe('SigV4 verification', () => {
     ).rejects.toMatchObject({ code: 'SignatureDoesNotMatch' })
   })
 
+  it.each([['x-amz-content-sha256', '0'.repeat(64)]])(
+    'rejects a modified %s header',
+    async (name) => {
+      const request = await signAuthorization()
+      const headers = new Headers(request.headers)
+      headers.set(name, name === 'host' ? 'wrong.example.com' : '0'.repeat(64))
+
+      await expect(
+        verifyRequest(new Request(request.url, { headers }), credentials, {
+          now: new Date('2026-11-15T02:00:00Z'),
+        }),
+      ).rejects.toMatchObject({
+        code: 'SignatureDoesNotMatch',
+      })
+    },
+  )
+
+  it('rejects a request moved to a different Host', async () => {
+    const request = await signAuthorization()
+
+    await expect(
+      verifyRequest(
+        new Request('https://evil.example.com/bucket/test.txt', {
+          headers: request.headers,
+        }),
+        credentials,
+        { now: new Date('2026-11-15T02:00:00Z') },
+      ),
+    ).rejects.toMatchObject({ code: 'SignatureDoesNotMatch' })
+  })
+
   it('verifies an Authorization header signature', async () => {
     const request = await signAuthorization()
 
@@ -246,6 +287,17 @@ describe('SigV4 verification', () => {
     ).rejects.toMatchObject({ code: 'RequestTimeTooSkewed' })
   })
 
+  it('treats an empty skew setting as invalid', async () => {
+    const request = await signAuthorization()
+
+    await expect(
+      verifyRequest(request, credentials, {
+        now: new Date('2026-11-15T02:15:01Z'),
+        maxSkewSeconds: '',
+      }),
+    ).rejects.toMatchObject({ code: 'RequestTimeTooSkewed' })
+  })
+
   it.each([
     ['expired', '2026-11-15T03:00:01Z', 'RequestExpired'],
     ['future-dated', '2026-11-14T23:59:59Z', 'RequestTimeTooSkewed'],
@@ -316,6 +368,27 @@ describe('SigV4 verification', () => {
     })
   })
 
+  it.each([
+    'X-Amz-Algorithm',
+    'X-Amz-Credential',
+    'X-Amz-Date',
+    'X-Amz-Expires',
+    'X-Amz-SignedHeaders',
+    'X-Amz-Signature',
+  ])('rejects a mixed-case duplicate %s parameter', async (parameter) => {
+    const url = new URL(await presignGet('test.txt'))
+    url.searchParams.append(
+      parameter.toLowerCase(),
+      url.searchParams.get(parameter),
+    )
+
+    await expect(
+      verifyRequest(new Request(url), credentials, {
+        now: new Date('2026-11-15T02:00:00Z'),
+      }),
+    ).rejects.toMatchObject({ code: 'AuthorizationHeaderMalformed' })
+  })
+
   it('rejects simultaneous header and presigned authentication', async () => {
     const request = await signAuthorization()
     const url = new URL(request.url)
@@ -334,6 +407,18 @@ describe('SigV4 verification', () => {
 
     await expect(
       verifyRequest(new Request(url), credentials, {
+        now: new Date('2026-11-15T02:00:00Z'),
+      }),
+    ).rejects.toMatchObject({ code: 'InvalidRequest' })
+  })
+
+  it('rejects security token headers', async () => {
+    const request = await signAuthorization({
+      headers: { 'x-amz-security-token': 'token' },
+    })
+
+    await expect(
+      verifyRequest(request, credentials, {
         now: new Date('2026-11-15T02:00:00Z'),
       }),
     ).rejects.toMatchObject({ code: 'InvalidRequest' })

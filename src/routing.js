@@ -88,7 +88,8 @@ export function routeRequest(request, env) {
   const upstream = new URL(incoming.toString())
   upstream.protocol = 'https:'
   upstream.port = ''
-  upstream.hostname = `${bucket}.${endpoint}`
+  upstream.hostname =
+    bucketSetting === '$path' ? endpoint : `${bucket}.${endpoint}`
   upstream.pathname = upstreamPathname
   upstream.search = removeQueryParameters(
     incoming.search,
@@ -99,6 +100,7 @@ export function routeRequest(request, env) {
       'x-amz-expires',
       'x-amz-signedheaders',
       'x-amz-signature',
+      'x-amz-content-sha256',
       'x-amz-security-token',
     ]),
   )

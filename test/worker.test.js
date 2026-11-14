@@ -119,6 +119,31 @@ describe('Worker proxy', () => {
     expect(await headResponse.text()).toBe('')
   })
 
+  it('always denies unsigned writes', async () => {
+    let upstreamCalls = 0
+    network.use(
+      http.put(
+        '*',
+        () => {
+          upstreamCalls += 1
+          return new HttpResponse(null, { status: 200 })
+        },
+        { once: true },
+      ),
+    )
+    const response = await worker.fetch(
+      new Request('https://cdn.example.com/object.bin', {
+        method: 'PUT',
+        body: 'unsigned',
+      }),
+      { ...baseEnv, ALLOW_UNSIGNED_READ: 'true' },
+    )
+
+    expect(response.status).toBe(403)
+    expect(await response.text()).toContain('<Code>AccessDenied</Code>')
+    expect(upstreamCalls).toBe(0)
+  })
+
   it('treats a malformed signature as an authentication failure', async () => {
     const env = { ...baseEnv, ALLOW_UNSIGNED_READ: 'true' }
     network.use(
@@ -152,6 +177,7 @@ describe('Worker proxy', () => {
           expect(request.headers.get('access-control-request-method')).toBe(
             'PUT',
           )
+          expect(request.headers.has('x-amz-security-token')).toBe(false)
           return new HttpResponse(null, {
             status: 204,
             headers: {
@@ -170,6 +196,7 @@ describe('Worker proxy', () => {
         headers: {
           origin: 'https://app.example.com',
           'access-control-request-method': 'PUT',
+          'x-amz-security-token': 'unsupported',
         },
       }),
       baseEnv,
@@ -277,6 +304,34 @@ describe('Worker proxy', () => {
     expect((await worker.fetch(request, baseEnv)).status).toBe(200)
     expect(checksum).toBe('checksum')
     expect(contentMd5).toBe('md5')
+  })
+
+  it('matches ALLOWED_HEADERS case-insensitively', async () => {
+    network.use(
+      http.put(
+        'https://my-bucket.s3.us-west-001.backblazeb2.com/object.bin',
+        ({ request }) => {
+          expect(request.headers.get('x-amz-meta-visible')).toBe('yes')
+          expect(request.headers.has('x-amz-meta-hidden')).toBe(false)
+          return new HttpResponse(null, { status: 200 })
+        },
+        { once: true },
+      ),
+    )
+    const request = await signedRequest('https://cdn.example.com/object.bin', {
+      method: 'PUT',
+      body: 'body',
+      headers: {
+        'x-amz-meta-visible': 'yes',
+        'x-amz-meta-hidden': 'no',
+      },
+    })
+    const response = await worker.fetch(request, {
+      ...baseEnv,
+      ALLOWED_HEADERS: ['X-Amz-Meta-Visible'],
+    })
+
+    expect(response.status).toBe(200)
   })
 
   it('signs a HEAD client request and uses GET upstream', async () => {
@@ -429,6 +484,32 @@ describe('Worker proxy', () => {
     }
   })
 
+  it('keeps $path bucket routing on the standard endpoint', async () => {
+    let receivedUrl
+    network.use(
+      http.get(
+        'https://s3.us-west-001.backblazeb2.com/my-bucket/object.bin',
+        ({ request }) => {
+          receivedUrl = request.url
+          return new HttpResponse(null, { status: 200 })
+        },
+        { once: true },
+      ),
+    )
+    const request = await signedRequest(
+      'https://cdn.example.com/my-bucket/object.bin',
+    )
+    const response = await worker.fetch(request, {
+      ...baseEnv,
+      BUCKET_NAME: '$path',
+    })
+
+    expect(response.status).toBe(200)
+    expect(receivedUrl).toBe(
+      'https://s3.us-west-001.backblazeb2.com/my-bucket/object.bin',
+    )
+  })
+
   it('does not modify successful response or cache headers', async () => {
     network.use(
       http.get(
@@ -481,26 +562,33 @@ describe('Worker proxy', () => {
 
   it('accepts a client presigned URL and removes its auth query', async () => {
     let receivedUrl
+    let payloadHash
     network.use(
       http.get(
         'https://my-bucket.s3.us-west-001.backblazeb2.com/object.bin',
         ({ request }) => {
           receivedUrl = request.url
+          payloadHash = request.headers.get('x-amz-content-sha256')
           expect(request.headers.has('authorization')).toBe(true)
           return HttpResponse.text('presigned object')
         },
         { once: true },
       ),
     )
-    const request = await presignedRequest(
+    const presigned = await presignedRequest(
       new URL('https://cdn.example.com/object.bin?versionId=2'),
     )
+    const request = new Request(presigned, {
+      headers: { 'x-amz-content-sha256': '0'.repeat(64) },
+    })
     const response = await worker.fetch(request, baseEnv)
 
     expect(response.status).toBe(200)
     expect(await response.text()).toBe('presigned object')
     expect(receivedUrl).not.toContain('X-Amz-Signature')
+    expect(receivedUrl).not.toMatch(/x-amz-content-sha256/i)
     expect(receivedUrl).toContain('versionId=2')
+    expect(payloadHash).toBe('UNSIGNED-PAYLOAD')
   })
 
   it('fails closed for a non-standard B2 endpoint', async () => {

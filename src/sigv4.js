@@ -4,6 +4,18 @@ const SIGNATURE_PATTERN = /^[0-9a-f]{64}$/i
 const MAX_PRESIGNED_TTL = 604800
 const DEFAULT_MAX_SKEW_SECONDS = 900
 const SIGNATURE_QUERY_PARAM = new Set(['x-amz-signature'])
+const AUTHENTICATION_QUERY_PARAMETERS = [
+  'X-Amz-Algorithm',
+  'X-Amz-Credential',
+  'X-Amz-Date',
+  'X-Amz-Expires',
+  'X-Amz-SignedHeaders',
+  'X-Amz-Signature',
+  'X-Amz-Content-Sha256',
+  'X-Amz-Security-Token',
+]
+const REQUIRED_PRESIGNED_QUERY_PARAMETERS =
+  AUTHENTICATION_QUERY_PARAMETERS.slice(0, 6)
 
 export class SigV4Error extends Error {
   constructor(code, message, status = 403) {
@@ -210,14 +222,22 @@ function parseRequestTime(request, signedHeaderNames) {
 }
 
 function parseMaxSkew(value) {
-  const parsed = Number(value)
+  const text = String(value).trim()
+  if (!/^\d+$/.test(text)) return DEFAULT_MAX_SKEW_SECONDS
+  const parsed = Number(text)
   return Number.isInteger(parsed) && parsed >= 0 && parsed <= 86400
     ? parsed
     : DEFAULT_MAX_SKEW_SECONDS
 }
 
+function getCaseInsensitiveParameterValues(params, name) {
+  return findCaseInsensitiveParamNames(params, [name]).flatMap((paramName) =>
+    params.getAll(paramName),
+  )
+}
+
 function requireSingleParameter(params, name) {
-  const values = params.getAll(name)
+  const values = getCaseInsensitiveParameterValues(params, name)
   if (values.length !== 1) {
     throw new SigV4Error(
       'AuthorizationHeaderMalformed',
@@ -501,17 +521,17 @@ function rejectStreaming(request, payloadHash, signedHeaderNames) {
 export async function verifyRequest(request, credentials, options = {}) {
   const url = new URL(request.url)
   const hasAuthorizationHeader = request.headers.has('authorization')
+  const hasSecurityTokenHeader = request.headers.has('x-amz-security-token')
   const hasPresignInformation =
-    findCaseInsensitiveParamNames(url.searchParams, [
-      'X-Amz-Algorithm',
-      'X-Amz-Credential',
-      'X-Amz-Date',
-      'X-Amz-Expires',
-      'X-Amz-SignedHeaders',
-      'X-Amz-Signature',
-      'X-Amz-Security-Token',
-    ]).length > 0
-  if (!hasAuthorizationHeader && !hasPresignInformation) {
+    findCaseInsensitiveParamNames(
+      url.searchParams,
+      AUTHENTICATION_QUERY_PARAMETERS,
+    ).length > 0
+  if (
+    !hasAuthorizationHeader &&
+    !hasPresignInformation &&
+    !hasSecurityTokenHeader
+  ) {
     if (options.requireAuthentication) {
       throw new SigV4Error(
         'AccessDenied',
@@ -533,15 +553,10 @@ export async function verifyRequest(request, credentials, options = {}) {
   }
 
   const hasAuthorization = request.headers.has('authorization')
-  const authParamNames = findCaseInsensitiveParamNames(url.searchParams, [
-    'X-Amz-Algorithm',
-    'X-Amz-Credential',
-    'X-Amz-Date',
-    'X-Amz-Expires',
-    'X-Amz-SignedHeaders',
-    'X-Amz-Signature',
-    'X-Amz-Security-Token',
-  ])
+  const authParamNames = findCaseInsensitiveParamNames(
+    url.searchParams,
+    AUTHENTICATION_QUERY_PARAMETERS,
+  )
   const hasAnyPresignParameter = authParamNames.length > 0
 
   if (hasAuthorization && hasAnyPresignParameter) {
@@ -563,6 +578,7 @@ export async function verifyRequest(request, credentials, options = {}) {
     )
   }
   if (
+    hasSecurityTokenHeader ||
     authParamNames.some((name) => name.toLowerCase() === 'x-amz-security-token')
   ) {
     throw new SigV4Error(
@@ -594,25 +610,31 @@ export async function verifyRequest(request, credentials, options = {}) {
     query = canonicalizeQuery(parseRawQuery(url.search.slice(1)))
   } else {
     const params = url.searchParams
-    for (const name of [
-      'X-Amz-Algorithm',
-      'X-Amz-Credential',
-      'X-Amz-Date',
-      'X-Amz-Expires',
-      'X-Amz-SignedHeaders',
-      'X-Amz-Signature',
-    ]) {
+    for (const name of REQUIRED_PRESIGNED_QUERY_PARAMETERS) {
       requireSingleParameter(params, name)
     }
-    if (params.get('X-Amz-Algorithm') !== ALGORITHM) {
+    if (
+      getCaseInsensitiveParameterValues(params, 'X-Amz-Content-Sha256').length >
+      1
+    ) {
+      throw new SigV4Error(
+        'AuthorizationHeaderMalformed',
+        'The X-Amz-Content-Sha256 query parameter must appear at most once.',
+        400,
+      )
+    }
+    if (requireSingleParameter(params, 'X-Amz-Algorithm') !== ALGORITHM) {
       throw new SigV4Error(
         'AuthorizationHeaderMalformed',
         'The presigned URL uses an unsupported signing algorithm.',
         400,
       )
     }
-    scope = parseScope(params.get('X-Amz-Credential'), credentials.accessKeyId)
-    longDate = params.get('X-Amz-Date')
+    scope = parseScope(
+      requireSingleParameter(params, 'X-Amz-Credential'),
+      credentials.accessKeyId,
+    )
+    longDate = requireSingleParameter(params, 'X-Amz-Date')
     if (!AMZ_DATE_PATTERN.test(longDate)) {
       throw new SigV4Error(
         'AuthorizationHeaderMalformed',
@@ -627,7 +649,7 @@ export async function verifyRequest(request, credentials, options = {}) {
         400,
       )
     }
-    const expiresText = params.get('X-Amz-Expires')
+    const expiresText = requireSingleParameter(params, 'X-Amz-Expires')
     if (!/^\d+$/.test(expiresText)) {
       throw new SigV4Error(
         'AuthorizationHeaderMalformed',
@@ -677,7 +699,7 @@ export async function verifyRequest(request, credentials, options = {}) {
         400,
       )
     }
-    signature = params.get('X-Amz-Signature')
+    signature = requireSingleParameter(params, 'X-Amz-Signature')
     if (!SIGNATURE_PATTERN.test(signature)) {
       throw new SigV4Error(
         'AuthorizationHeaderMalformed',
@@ -757,24 +779,25 @@ export async function verifyRequest(request, credentials, options = {}) {
 }
 
 export function hasSigV4Information(request) {
-  if (request.headers.has('authorization')) return true
+  if (
+    request.headers.has('authorization') ||
+    request.headers.has('x-amz-security-token')
+  ) {
+    return true
+  }
   const url = new URL(request.url)
   return (
-    findCaseInsensitiveParamNames(url.searchParams, [
-      'X-Amz-Algorithm',
-      'X-Amz-Credential',
-      'X-Amz-Date',
-      'X-Amz-Expires',
-      'X-Amz-SignedHeaders',
-      'X-Amz-Signature',
-      'X-Amz-Security-Token',
-    ]).length > 0
+    findCaseInsensitiveParamNames(
+      url.searchParams,
+      AUTHENTICATION_QUERY_PARAMETERS,
+    ).length > 0
   )
 }
 
 function parseLongDate(value) {
   if (!AMZ_DATE_PATTERN.test(value)) return NaN
-  return new Date(
+  const time = new Date(
     `${value.slice(0, 4)}-${value.slice(4, 6)}-${value.slice(6, 8)}T${value.slice(9, 11)}:${value.slice(11, 13)}:${value.slice(13, 15)}Z`,
   ).getTime()
+  return Number.isNaN(time) || formatAmzDate(time) !== value ? NaN : time
 }

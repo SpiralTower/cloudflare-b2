@@ -43,6 +43,7 @@ const UNSIGNABLE_HEADERS = new Set([
   'x-forwarded-proto',
   'x-real-ip',
   'x-amz-date',
+  'x-amz-security-token',
 ])
 
 function escapeXml(value) {
@@ -72,7 +73,9 @@ function errorResponse(error) {
     return xmlError(
       error.code,
       error.message,
-      error.code === 'InvalidRequest' ? 400 : 500,
+      ['InvalidRequest', 'AuthorizationHeaderMalformed'].includes(error.code)
+        ? 400
+        : 500,
     )
   }
   console.error(error)
@@ -80,15 +83,21 @@ function errorResponse(error) {
 }
 
 function filterHeaders(headers, env) {
-  const allowed = env.ALLOWED_HEADERS
+  const allowed =
+    env.ALLOWED_HEADERS === undefined
+      ? null
+      : new Set(
+          Array.from(env.ALLOWED_HEADERS, (name) =>
+            String(name).trim().toLowerCase(),
+          ),
+        )
   return new Headers(
     Array.from(headers.entries()).filter(([name]) => {
       const lowerName = name.toLowerCase()
       if (UNSIGNABLE_HEADERS.has(lowerName) || lowerName.startsWith('cf-')) {
         return false
       }
-      if (allowed === undefined) return true
-      return allowed.includes(lowerName)
+      return allowed === null || allowed.has(lowerName)
     }),
   )
 }
@@ -162,14 +171,23 @@ export default {
         requireAuthentication: true,
       }
       const anonymousRead = isAnonymousReadAllowed(request, env)
+      let verification = null
 
       if (request.method !== 'OPTIONS') {
         if (anonymousRead) {
           if (hasSigV4Information(request)) {
-            await verifyRequest(request, credentials, verificationOptions)
+            verification = await verifyRequest(
+              request,
+              credentials,
+              verificationOptions,
+            )
           }
         } else {
-          await verifyRequest(request, credentials, verificationOptions)
+          verification = await verifyRequest(
+            request,
+            credentials,
+            verificationOptions,
+          )
         }
       }
 
@@ -184,7 +202,7 @@ export default {
       const payloadHash =
         request.method === 'HEAD' || request.method === 'OPTIONS'
           ? 'UNSIGNED-PAYLOAD'
-          : request.headers.get('x-amz-content-sha256') || 'UNSIGNED-PAYLOAD'
+          : verification?.payloadHash || 'UNSIGNED-PAYLOAD'
       const signed = await signRequest({
         method: upstreamMethod,
         url: route.upstream,

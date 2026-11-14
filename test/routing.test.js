@@ -65,9 +65,7 @@ describe('routing', () => {
     )
 
     expect(result.upstream.pathname).toBe('/bucket/folder/test.txt')
-    expect(result.upstream.hostname).toBe(
-      'bucket.s3.us-west-001.backblazeb2.com',
-    )
+    expect(result.upstream.hostname).toBe('s3.us-west-001.backblazeb2.com')
   })
 
   it('routes $host buckets', () => {
@@ -111,9 +109,13 @@ describe('routing', () => {
   it('removes authentication query parameters case-insensitively', () => {
     expect(
       removeQueryParameters(
-        '?x-amz-signature=1&versionId=2&X-Amz-Credential=3&x=4',
-        new Set(['x-amz-signature', 'x-amz-credential']),
+        '?x-amz-signature=1&versionId=2&X-Amz-Credential=3&x-amz-content-sha256=4&x=5',
+        new Set([
+          'x-amz-signature',
+          'x-amz-credential',
+          'x-amz-content-sha256',
+        ]),
       ),
-    ).toBe('?versionId=2&x=4')
+    ).toBe('?versionId=2&x=5')
   })
 })
