@@ -45,17 +45,10 @@ export function canonicalizePath(pathname) {
     )
   }
 
-  const canonicalSegments = decoded
+  return decoded
     .split('/')
-    .filter((segment) => segment !== '.')
-    .reduce((segments, segment) => {
-      if (segment === '..') segments.pop()
-      else segments.push(segment)
-      return segments
-    }, [])
     .map((segment) => rfc3986Encode(segment))
     .join('/')
-  return `/${canonicalSegments.replace(/^\/+/, '')}`
 }
 
 export function parseRawQuery(query) {
@@ -379,6 +372,94 @@ async function calculateSignature({
     scope.region,
   )
   return toHex(await hmac(signingKey, stringToSign))
+}
+
+function formatAmzDate(value) {
+  return new Date(value).toISOString().replace(/[-:]|\.\d{3}/g, '')
+}
+
+export async function signRequest({
+  method,
+  url,
+  headers: inputHeaders = new Headers(),
+  payloadHash = 'UNSIGNED-PAYLOAD',
+  credentials,
+  region,
+  now = new Date(),
+}) {
+  if (
+    typeof credentials?.accessKeyId !== 'string' ||
+    typeof credentials?.secretAccessKey !== 'string'
+  ) {
+    throw new SigV4Error(
+      'AccessDenied',
+      'Worker signing credentials are not configured.',
+      500,
+    )
+  }
+  if (typeof region !== 'string' || region === '') {
+    throw new SigV4Error(
+      'InvalidRequest',
+      'The upstream region could not be determined.',
+      500,
+    )
+  }
+
+  const requestUrl = new URL(url)
+  const longDate = formatAmzDate(now)
+  const shortDate = longDate.slice(0, 8)
+  const headers = new Headers(inputHeaders)
+  headers.delete('authorization')
+  headers.delete('host')
+  headers.set('x-amz-content-sha256', payloadHash)
+  headers.set('x-amz-date', longDate)
+
+  const signedHeaderNames = new Set([
+    'host',
+    'x-amz-content-sha256',
+    'x-amz-date',
+  ])
+  for (const name of headers.keys()) {
+    const lowerName = name.toLowerCase()
+    if (
+      lowerName.startsWith('x-amz-') ||
+      lowerName === 'content-md5' ||
+      lowerName === 'content-type'
+    ) {
+      signedHeaderNames.add(lowerName)
+    }
+  }
+  const sortedSignedHeaders = Array.from(signedHeaderNames).sort()
+  const signedHeaders = canonicalizeHeaders(
+    headers,
+    sortedSignedHeaders,
+    requestUrl.host,
+  )
+  const scope = { shortDate, region }
+  const query = canonicalizeQuery(
+    parseRawQuery(requestUrl.search.replace(/^\?/, '')),
+  )
+  const signature = await calculateSignature({
+    method,
+    pathname: requestUrl.pathname,
+    query,
+    signedHeaderNames: sortedSignedHeaders,
+    signedHeaders,
+    payloadHash,
+    longDate,
+    scope,
+    secretAccessKey: credentials.secretAccessKey,
+  })
+  const authorization = `${ALGORITHM} Credential=${credentials.accessKeyId}/${shortDate}/${region}/s3/aws4_request, SignedHeaders=${sortedSignedHeaders.join(';')}, Signature=${signature}`
+  headers.set('authorization', authorization)
+
+  return {
+    headers,
+    authorization,
+    amzDate: longDate,
+    signedHeaders: sortedSignedHeaders,
+    payloadHash,
+  }
 }
 
 function validatePayloadHash(value) {
