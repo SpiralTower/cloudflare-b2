@@ -75,6 +75,25 @@ describe('Worker proxy', () => {
     expect(await response.text()).toContain('<Code>MethodNotAllowed</Code>')
   })
 
+  it('rejects non-HTTP request URLs without contacting upstream', async () => {
+    network.use(
+      http.get(
+        '*',
+        () => {
+          throw new Error('upstream should not be called')
+        },
+        { once: true },
+      ),
+    )
+    const response = await worker.fetch(
+      new Request('ftp://cdn.example.com/test.txt'),
+      baseEnv,
+    )
+
+    expect(response.status).toBe(400)
+    expect(await response.text()).toContain('<Code>InvalidRequest</Code>')
+  })
+
   it('denies unsigned reads by default without contacting upstream', async () => {
     network.use(
       http.get(
@@ -177,6 +196,9 @@ describe('Worker proxy', () => {
           expect(request.headers.get('access-control-request-method')).toBe(
             'PUT',
           )
+          expect(request.headers.get('access-control-request-headers')).toBe(
+            'content-type',
+          )
           expect(request.headers.has('x-amz-security-token')).toBe(false)
           return new HttpResponse(null, {
             status: 204,
@@ -196,16 +218,35 @@ describe('Worker proxy', () => {
         headers: {
           origin: 'https://app.example.com',
           'access-control-request-method': 'PUT',
+          'access-control-request-headers': 'content-type',
           'x-amz-security-token': 'unsupported',
         },
       }),
-      baseEnv,
+      { ...baseEnv, ALLOWED_HEADERS: ['x-unrelated'] },
     )
 
     expect(response.status).toBe(204)
     expect(response.headers.get('access-control-allow-origin')).toBe(
       'https://app.example.com',
     )
+  })
+
+  it('allows authenticated bucket-root POST operations when listing is disabled', async () => {
+    network.use(
+      http.post(
+        'https://my-bucket.s3.us-west-001.backblazeb2.com/?delete',
+        () => HttpResponse.xml('<DeleteResult/>'),
+        { once: true },
+      ),
+    )
+    const request = await signedRequest('https://cdn.example.com/?delete', {
+      method: 'POST',
+      body: '<Delete/>',
+    })
+    const response = await worker.fetch(request, baseEnv)
+
+    expect(response.status).toBe(200)
+    expect(await response.text()).toBe('<DeleteResult/>')
   })
 
   it('denies bucket listing by default', async () => {

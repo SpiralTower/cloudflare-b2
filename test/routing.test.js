@@ -18,9 +18,16 @@ describe('routing', () => {
   })
 
   it('rejects a non-standard endpoint', () => {
-    expect(() => parseB2Endpoint('example.com')).toThrow(
-      'standard Backblaze B2 S3 endpoint',
-    )
+    for (const endpoint of [
+      'example.com',
+      'f001.backblazeb2.com',
+      'foo.bar.backblazeb2.com',
+      's3.evil.foo.backblazeb2.com',
+    ]) {
+      expect(() => parseB2Endpoint(endpoint)).toThrow(
+        'standard Backblaze B2 S3 endpoint',
+      )
+    }
   })
 
   it('routes a fixed bucket and preserves the query order', () => {
@@ -104,6 +111,15 @@ describe('routing', () => {
     )
 
     expect(result.upstream.pathname).toBe('/my-bucket/folder/test.txt')
+  })
+
+  it('preserves repeated and trailing path slashes upstream', () => {
+    const result = routeRequest(
+      new Request('https://cdn.example.com/folder//object///'),
+      { ...baseEnv, BUCKET_NAME: 'my-bucket' },
+    )
+
+    expect(result.upstream.pathname).toBe('/folder//object///')
   })
 
   it('removes authentication query parameters case-insensitively', () => {

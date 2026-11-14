@@ -659,6 +659,13 @@ export async function verifyRequest(request, credentials, options = {}) {
     }
     const expires = Number(expiresText)
     const issuedAt = parseLongDate(longDate)
+    if (Number.isNaN(issuedAt)) {
+      throw new SigV4Error(
+        'AuthorizationHeaderMalformed',
+        'X-Amz-Date must be a valid date.',
+        400,
+      )
+    }
     if (issuedAt > requestTime.getTime()) {
       throw new SigV4Error(
         'RequestTimeTooSkewed',

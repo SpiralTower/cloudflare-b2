@@ -1,5 +1,4 @@
-const B2_ENDPOINT_PATTERN =
-  /^(?:s3\.([a-z0-9-]+)\.backblazeb2\.com|(.+)\.backblazeb2\.com)$/i
+const B2_ENDPOINT_PATTERN = /^s3\.([a-z]{2}-[a-z]+-\d{3})\.backblazeb2\.com$/i
 
 export class RoutingError extends Error {
   constructor(code, message) {
@@ -22,7 +21,7 @@ export function parseB2Endpoint(endpoint) {
   }
   return {
     endpoint: value,
-    region: match[1] || match[2],
+    region: match[1],
   }
 }
 
@@ -77,12 +76,12 @@ export function routeRequest(request, env) {
     keySegments = isRcloneRequest ? rcloneSegments.slice(2) : segments
   }
 
-  const pathParts =
-    bucketSetting === '$path' ? [bucket, ...keySegments] : keySegments
-  let upstreamPathname = pathParts.length > 0 ? `/${pathParts.join('/')}` : ''
-  if (upstreamPathname === '') upstreamPathname = '/'
-  if (incoming.pathname.endsWith('/') && !upstreamPathname.endsWith('/')) {
-    upstreamPathname += '/'
+  let upstreamPathname = incoming.pathname
+  if (isRcloneRequest) {
+    const prefixLength = bucketSetting === '$path' ? 1 : 2
+    const remainingSegments = rcloneSegments.slice(prefixLength)
+    upstreamPathname =
+      remainingSegments.length > 0 ? `/${remainingSegments.join('/')}` : '/'
   }
 
   const upstream = new URL(incoming.toString())

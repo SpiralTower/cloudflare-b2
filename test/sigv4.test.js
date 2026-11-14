@@ -456,6 +456,22 @@ describe('SigV4 verification', () => {
     ).resolves.toMatchObject({ kind: 'authorization' })
   })
 
+  it('rejects an impossible presigned date', async () => {
+    const url = new URL(await presignGet('test.txt'))
+    const credential = url.searchParams.get('X-Amz-Credential')
+    url.searchParams.set('X-Amz-Date', '20260230T020000Z')
+    url.searchParams.set(
+      'X-Amz-Credential',
+      credential.replace('20261115', '20260230'),
+    )
+
+    await expect(
+      verifyRequest(new Request(url), credentials, {
+        now: new Date('2026-03-01T00:00:00Z'),
+      }),
+    ).rejects.toMatchObject({ code: 'AuthorizationHeaderMalformed' })
+  })
+
   it.each([
     ['duplicate signature', 'X-Amz-Signature'],
     ['missing signature', 'X-Amz-Signature'],

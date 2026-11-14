@@ -18,6 +18,12 @@ const SUPPORTED_METHODS = new Set([
   'OPTIONS',
 ])
 const RANGE_RETRY_ATTEMPTS = 3
+const CORS_REQUEST_HEADERS = new Set([
+  'origin',
+  'access-control-request-method',
+  'access-control-request-headers',
+  'access-control-request-private-network',
+])
 const UNSIGNABLE_HEADERS = new Set([
   'accept-encoding',
   'authorization',
@@ -35,6 +41,8 @@ const UNSIGNABLE_HEADERS = new Set([
   'if-unmodified-since',
   'keep-alive',
   'proxy-connection',
+  'proxy-authenticate',
+  'proxy-authorization',
   'te',
   'trailer',
   'transfer-encoding',
@@ -82,7 +90,7 @@ function errorResponse(error) {
   return xmlError('InternalError', 'Internal server error', 500)
 }
 
-function filterHeaders(headers, env) {
+function filterHeaders(headers, env, preserveCors = false) {
   const allowed =
     env.ALLOWED_HEADERS === undefined
       ? null
@@ -97,7 +105,11 @@ function filterHeaders(headers, env) {
       if (UNSIGNABLE_HEADERS.has(lowerName) || lowerName.startsWith('cf-')) {
         return false
       }
-      return allowed === null || allowed.has(lowerName)
+      return (
+        allowed === null ||
+        allowed.has(lowerName) ||
+        (preserveCors && CORS_REQUEST_HEADERS.has(lowerName))
+      )
     }),
   )
 }
@@ -154,6 +166,13 @@ export default {
           405,
         )
       }
+      if (!['http:', 'https:'].includes(new URL(request.url).protocol)) {
+        return xmlError(
+          'InvalidRequest',
+          'Only HTTP and HTTPS requests are supported.',
+          400,
+        )
+      }
       if (isHtmlPostPolicy(request)) {
         return xmlError(
           'NotImplemented',
@@ -192,7 +211,11 @@ export default {
       }
 
       const route = routeRequest(request, env)
-      if (route.isListBucket && String(env.ALLOW_LIST_BUCKET) !== 'true') {
+      if (
+        route.isListBucket &&
+        ['GET', 'HEAD'].includes(request.method) &&
+        String(env.ALLOW_LIST_BUCKET) !== 'true'
+      ) {
         return xmlError(
           'AccessDenied',
           'Bucket listing is disabled for this deployment.',
@@ -206,7 +229,11 @@ export default {
       const signed = await signRequest({
         method: upstreamMethod,
         url: route.upstream,
-        headers: filterHeaders(request.headers, env),
+        headers: filterHeaders(
+          request.headers,
+          env,
+          request.method === 'OPTIONS',
+        ),
         payloadHash,
         credentials,
         region: route.region,
