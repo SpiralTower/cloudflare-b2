@@ -18,12 +18,14 @@ const SUPPORTED_METHODS = new Set([
   'OPTIONS',
 ])
 const RANGE_RETRY_ATTEMPTS = 3
+const UNSIGNED_FORWARD_HEADERS = new Set(['content-length'])
 const CORS_REQUEST_HEADERS = new Set([
   'origin',
   'access-control-request-method',
   'access-control-request-headers',
   'access-control-request-private-network',
 ])
+const CONTENT_LENGTH_PATTERN = /^\d+$/
 const UNSIGNABLE_HEADERS = new Set([
   'accept-encoding',
   'authorization',
@@ -32,7 +34,6 @@ const UNSIGNABLE_HEADERS = new Set([
   'cf-ray',
   'cf-visitor',
   'connection',
-  'content-length',
   'host',
   'if-match',
   'if-modified-since',
@@ -53,6 +54,14 @@ const UNSIGNABLE_HEADERS = new Set([
   'x-amz-date',
   'x-amz-security-token',
 ])
+
+class RequestBodyError extends Error {
+  constructor(code, message) {
+    super(message)
+    this.name = 'RequestBodyError'
+    this.code = code
+  }
+}
 
 function escapeXml(value) {
   return String(value)
@@ -86,6 +95,9 @@ function errorResponse(error) {
         : 500,
     )
   }
+  if (error instanceof RequestBodyError) {
+    return xmlError(error.code, error.message, 400)
+  }
   console.error(error)
   return xmlError('InternalError', 'Internal server error', 500)
 }
@@ -106,12 +118,107 @@ function filterHeaders(headers, env, preserveCors = false) {
         return false
       }
       return (
+        UNSIGNED_FORWARD_HEADERS.has(lowerName) ||
         allowed === null ||
         allowed.has(lowerName) ||
         (preserveCors && CORS_REQUEST_HEADERS.has(lowerName))
       )
     }),
   )
+}
+
+function parseContentLength(request) {
+  const value = request.headers.get('content-length')
+  if (value === null) return null
+  if (!CONTENT_LENGTH_PATTERN.test(value)) {
+    throw new RequestBodyError(
+      'InvalidRequest',
+      'The Content-Length header must be a non-negative integer.',
+    )
+  }
+  const length = Number(value)
+  if (!Number.isSafeInteger(length)) {
+    throw new RequestBodyError(
+      'InvalidRequest',
+      'The Content-Length header is too large.',
+    )
+  }
+  return length
+}
+
+async function bufferRequestBody(request, expectedLength) {
+  const chunks = []
+  let receivedLength = 0
+  const reader = request.body.getReader()
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      receivedLength += value.byteLength
+      if (receivedLength > expectedLength) {
+        throw new RequestBodyError(
+          'IncompleteBody',
+          'The request body is larger than the Content-Length header.',
+        )
+      }
+      chunks.push(value)
+    }
+  } finally {
+    reader.releaseLock()
+  }
+  if (receivedLength !== expectedLength) {
+    throw new RequestBodyError(
+      'IncompleteBody',
+      'The request body length does not match the Content-Length header.',
+    )
+  }
+  const body = new Uint8Array(receivedLength)
+  let offset = 0
+  for (const chunk of chunks) {
+    body.set(chunk, offset)
+    offset += chunk.byteLength
+  }
+  return body
+}
+
+async function prepareUpstreamBody(request, upstreamMethod, signedHeaders) {
+  if (upstreamMethod === 'GET' || upstreamMethod === 'HEAD') {
+    return { body: undefined, headers: signedHeaders }
+  }
+
+  const contentLength = parseContentLength(request)
+  const decodedContentLength = request.headers.get(
+    'x-amz-decoded-content-length',
+  )
+
+  if (contentLength !== null && decodedContentLength !== null) {
+    throw new RequestBodyError(
+      'InvalidRequest',
+      'Content-Length and x-amz-decoded-content-length cannot be used together.',
+    )
+  }
+
+  if (contentLength === null) {
+    if (request.body === null) {
+      return { body: undefined, headers: signedHeaders }
+    }
+    return { body: request.body, headers: signedHeaders }
+  }
+
+  const headers = new Headers(signedHeaders)
+  if (contentLength === 0 && request.body === null) {
+    return { body: undefined, headers }
+  }
+  if (request.body === null) {
+    throw new RequestBodyError(
+      'IncompleteBody',
+      'The request body length does not match the Content-Length header.',
+    )
+  }
+
+  const body = await bufferRequestBody(request, contentLength)
+  headers.set('content-length', String(contentLength))
+  return { body, headers }
 }
 
 function headResponse(response) {
@@ -226,25 +333,28 @@ export default {
         request.method === 'HEAD' || request.method === 'OPTIONS'
           ? 'UNSIGNED-PAYLOAD'
           : verification?.payloadHash || 'UNSIGNED-PAYLOAD'
+      const filteredHeaders = filterHeaders(
+        request.headers,
+        env,
+        request.method === 'OPTIONS',
+      )
       const signed = await signRequest({
         method: upstreamMethod,
         url: route.upstream,
-        headers: filterHeaders(
-          request.headers,
-          env,
-          request.method === 'OPTIONS',
-        ),
+        headers: filteredHeaders,
         payloadHash,
         credentials,
         region: route.region,
       })
+      const upstreamBody = await prepareUpstreamBody(
+        request,
+        upstreamMethod,
+        signed.headers,
+      )
       const upstreamRequest = new Request(route.upstream, {
         method: upstreamMethod,
-        headers: signed.headers,
-        body:
-          upstreamMethod === 'GET' || upstreamMethod === 'HEAD'
-            ? undefined
-            : request.body,
+        headers: upstreamBody.headers,
+        body: upstreamBody.body,
         redirect: 'manual',
       })
       const response = await fetchWithRangeRetry(upstreamRequest)

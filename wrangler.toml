@@ -33,6 +33,10 @@ RCLONE_DOWNLOAD = "false"
 # Authentication headers, host, body framing, hop-by-hop headers, Cloudflare
 # headers, and the headers listed in the README are always filtered.
 # Header names are case-insensitive.
+#
+# Upload clients should use an HTTPS S3 endpoint and fixed-length request
+# bodies. Forgejo with MinIO storage must set MINIO_USE_SSL = true; its HTTP
+# endpoint mode uses AWS streaming SigV4, which this Worker rejects.
 #ALLOWED_HEADERS = [
 #    "content-type",
 #    "if-match",

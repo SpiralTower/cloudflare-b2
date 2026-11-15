@@ -8,8 +8,8 @@
 映射到 B2 S3 域名，再用同一组凭据重签并转发给 B2。
 
 支持 S3 REST `GET`、`HEAD`、`PUT`、`POST`、`DELETE` 和 `OPTIONS`，包括 DNS
-风格、路径风格、multipart REST 和预签名 URL。不支持 HTML POST policy 上传、
-AWS streaming chunk/trailer 签名、SigV4a 和 session token。
+风格、路径风格、固定长度上传、multipart REST 和预签名 URL。不支持 HTML POST
+policy 上传、AWS streaming chunk/trailer 签名、SigV4a 和 session token。
 
 ## 要求
 
@@ -53,7 +53,7 @@ printf '%s' '<your b2 application key>' | npx wrangler secret put B2_APPLICATION
 | `ALLOW_UNSIGNED_READ`        | `false`     | 允许完全未签名的 `GET`/`HEAD`（包括 Range）；匿名写始终拒绝。                                                    |
 | `SIGNATURE_MAX_SKEW_SECONDS` | `900`       | Authorization 头签名可接受的时钟偏差，范围 `0..86400`。无效值回退到 `900`。预签名 URL 使用严格签发及过期检查。   |
 | `RCLONE_DOWNLOAD`            | `false`     | 转发前移除 rclone 的 `file/` 前缀，但仍按客户端实际 CDN URL 验签。                                               |
-| `ALLOWED_HEADERS`            | 未设置      | 设置后仅转发列出的客户端请求头，名称不区分大小写。                                                               |
+| `ALLOWED_HEADERS`            | 未设置      | 设置后仅转发列出的客户端请求头。`Content-Length` 单独处理以保留固定长度上传，名称不区分大小写。                  |
 
 `ALLOW_LIST_BUCKET` 和 `ALLOW_UNSIGNED_READ` 相互独立。匿名列出桶必须同时设置
 `ALLOW_UNSIGNED_READ="true"` 和 `ALLOW_LIST_BUCKET="true"`。
@@ -132,7 +132,10 @@ security token 的 URL 会被拒绝。Worker 会移除认证 query，并使用
 - `OPTIONS` 绕过验签并转发给 B2，由桶的 CORS 配置决定响应。
 - `multipart/form-data` POST policy 返回 `NotImplemented`；其他 S3 REST POST
   在验签后转发。
-- 请求 body 直接从客户端流式转发，不读取、不缓存、不 tee。
+- 带 `Content-Length` 的请求会先完整读取并校验，再以相同长度转发到上游。body
+  短于或长于声明长度时返回 `IncompleteBody`；格式非法时返回 `InvalidRequest`。
+- 不带 `Content-Length` 的请求 body 仍直接从客户端流式转发，不读取、不缓存、不
+  tee。AWS streaming SigV4 请求仍不支持。
 - 客户端签名过的 `x-amz-checksum-*`、`content-md5` 和完整性相关请求头会透传
   并由 Worker 重签。
 - `HEAD` 按客户端 `HEAD` 验签，以 `GET` 重签上游，响应不返回 body。
@@ -145,6 +148,9 @@ security token 的 URL 会被拒绝。Worker 会移除认证 query，并使用
 `cf-*` 前缀、`accept-encoding` 和条件请求头（`if-match`、
 `if-modified-since`、`if-none-match`、`if-range`、`if-unmodified-since`）。
 Worker 还会在重签前移除旧 `Authorization`、`Host` 和 `x-amz-date`。
+
+`Content-Length` 会根据已验证的请求 body 长度恢复，并在不纳入上游签名的情况下
+转发；无需加入 `ALLOWED_HEADERS`。
 
 如需进一步限制转发头，可设置：
 
@@ -167,6 +173,10 @@ ALLOWED_HEADERS = [
 S3 multipart REST（CreateMultipartUpload、UploadPart、
 CompleteMultipartUpload、AbortMultipartUpload、ListParts 等）通过普通签名
 流程支持。HTML POST policy 上传不支持。
+
+Forgejo 的 MinIO storage 等客户端应使用固定长度上传。Forgejo 必须使用 HTTPS
+S3 endpoint（`MINIO_USE_SSL=true`）；其 HTTP endpoint 模式会使用 AWS streaming
+SigV4，本 Worker 会明确拒绝。
 
 ## Rclone 下载
 

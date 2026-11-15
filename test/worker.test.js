@@ -20,6 +20,13 @@ async function signedRequest(url, options = {}) {
   const body = options.body
   const headers = new Headers(options.headers)
   if (body !== undefined) headers.set('content-type', 'text/plain')
+  if (
+    body !== undefined &&
+    options.contentLength !== false &&
+    headers.get('content-length') === null
+  ) {
+    headers.set('content-length', String(new TextEncoder().encode(body).length))
+  }
   const signed = await signRequest({
     method: options.method || 'GET',
     url: options.signUrl || url,
@@ -39,6 +46,7 @@ async function signedRequest(url, options = {}) {
     method: options.method || 'GET',
     headers,
     body,
+    duplex: body === undefined ? undefined : 'half',
   })
 }
 
@@ -275,7 +283,7 @@ describe('Worker proxy', () => {
     expect(await response.text()).toBe('<ListBucketResult/>')
   })
 
-  it('streams PUT bodies through one upstream fetch', async () => {
+  it('forwards PUT bodies through one upstream fetch', async () => {
     let upstreamCalls = 0
     let receivedBody
     network.use(
@@ -301,6 +309,266 @@ describe('Worker proxy', () => {
     expect(upstreamCalls).toBe(1)
     expect(receivedBody).toBe('request body')
   }, 10000)
+
+  it('streams PUT bodies without an explicit Content-Length', async () => {
+    let receivedBody
+    network.use(
+      http.put(
+        'https://my-bucket.s3.us-west-001.backblazeb2.com/object.bin',
+        async ({ request }) => {
+          receivedBody = await request.text()
+          return new HttpResponse(null, { status: 200 })
+        },
+        { once: true },
+      ),
+    )
+    const request = await signedRequest('https://cdn.example.com/object.bin', {
+      method: 'PUT',
+      body: 'request body',
+      contentLength: false,
+    })
+    expect(request.headers.has('content-length')).toBe(false)
+
+    const response = await worker.fetch(request, baseEnv)
+
+    expect(response.status).toBe(200)
+    expect(receivedBody).toBe('request body')
+  })
+
+  it('preserves fixed request lengths for uploads', async () => {
+    let receivedBody
+    let receivedLength
+    let receivedPayloadHash
+    let authorization
+    network.use(
+      http.put(
+        'https://my-bucket.s3.us-west-001.backblazeb2.com/object.bin',
+        async ({ request }) => {
+          receivedBody = await request.text()
+          receivedLength = request.headers.get('content-length')
+          receivedPayloadHash = request.headers.get('x-amz-content-sha256')
+          authorization = request.headers.get('authorization')
+          return new HttpResponse(null, { status: 200 })
+        },
+        { once: true },
+      ),
+    )
+    const request = await signedRequest('https://cdn.example.com/object.bin', {
+      method: 'PUT',
+      body: 'request body',
+    })
+
+    const response = await worker.fetch(request, baseEnv)
+
+    expect(response.status).toBe(200)
+    expect(receivedBody).toBe('request body')
+    expect(receivedLength).toBe('12')
+    expect(receivedPayloadHash).toBe('UNSIGNED-PAYLOAD')
+    expect(authorization).not.toContain('content-length')
+  })
+
+  it.each([
+    ['below', '3', 'request body'],
+    ['above', '13', 'request body'],
+  ])(
+    'rejects a body length %s Content-Length without contacting upstream',
+    async (_label, contentLength, body) => {
+      network.use(
+        http.put(
+          '*',
+          () => {
+            throw new Error('upstream should not be called')
+          },
+          { once: true },
+        ),
+      )
+      const request = await signedRequest(
+        'https://cdn.example.com/object.bin',
+        {
+          method: 'PUT',
+          body,
+          headers: { 'content-length': contentLength },
+        },
+      )
+
+      const response = await worker.fetch(request, baseEnv)
+
+      expect(response.status).toBe(400)
+      expect(await response.text()).toContain('<Code>IncompleteBody</Code>')
+    },
+  )
+
+  it.each(['-1', '1.5', 'bytes', ''])(
+    'rejects invalid Content-Length %j without contacting upstream',
+    async (contentLength) => {
+      network.use(
+        http.put(
+          '*',
+          () => {
+            throw new Error('upstream should not be called')
+          },
+          { once: true },
+        ),
+      )
+      const request = await signedRequest(
+        'https://cdn.example.com/object.bin',
+        {
+          method: 'PUT',
+          body: 'body',
+          headers: { 'content-length': contentLength },
+        },
+      )
+
+      const response = await worker.fetch(request, baseEnv)
+
+      expect(response.status).toBe(400)
+      expect(await response.text()).toContain('<Code>InvalidRequest</Code>')
+    },
+  )
+
+  it('rejects a repeated Content-Length without contacting upstream', async () => {
+    network.use(
+      http.put(
+        '*',
+        () => {
+          throw new Error('upstream should not be called')
+        },
+        { once: true },
+      ),
+    )
+    const request = await signedRequest('https://cdn.example.com/object.bin', {
+      method: 'PUT',
+      body: 'body',
+      headers: { 'content-length': '4, 4' },
+    })
+
+    const response = await worker.fetch(request, baseEnv)
+
+    expect(response.status).toBe(400)
+    expect(await response.text()).toContain('<Code>InvalidRequest</Code>')
+  })
+
+  it('accepts an explicit zero-length upload', async () => {
+    let receivedBody
+    network.use(
+      http.put(
+        'https://my-bucket.s3.us-west-001.backblazeb2.com/empty.bin',
+        async ({ request }) => {
+          receivedBody = await request.text()
+          return new HttpResponse(null, { status: 200 })
+        },
+        { once: true },
+      ),
+    )
+    const request = await signedRequest('https://cdn.example.com/empty.bin', {
+      method: 'PUT',
+      headers: { 'content-length': '0' },
+    })
+    const response = await worker.fetch(request, baseEnv)
+
+    expect(response.status).toBe(200)
+    expect(receivedBody).toBe('')
+  })
+
+  it('completes a multipart upload with fixed-length parts', async () => {
+    const key = `multipart-${crypto.randomUUID()}.bin`
+    const firstPart = new Uint8Array(5 * 1024 * 1024).fill(0x31)
+    const lastPart = new Uint8Array(257 * 1024).fill(0x32)
+    const uploadId = 'test-upload-id'
+    let createLength
+    let completeBody
+    let completeLength
+    const partRequests = []
+    network.use(
+      http.post(
+        `https://my-bucket.s3.us-west-001.backblazeb2.com/${key}`,
+        async ({ request }) => {
+          const url = new URL(request.url)
+          if (url.searchParams.has('uploads')) {
+            createLength = request.headers.get('content-length')
+            return HttpResponse.xml(
+              `<InitiateMultipartUploadResult><UploadId>${uploadId}</UploadId></InitiateMultipartUploadResult>`,
+            )
+          }
+          completeBody = await request.text()
+          completeLength = request.headers.get('content-length')
+          return HttpResponse.xml('<CompleteMultipartUploadResult/>')
+        },
+      ),
+      http.put(
+        `https://my-bucket.s3.us-west-001.backblazeb2.com/${key}`,
+        async ({ request }) => {
+          const url = new URL(request.url)
+          const partNumber = url.searchParams.get('partNumber')
+          const bodyLength = (await request.arrayBuffer()).byteLength
+          partRequests.push({
+            partNumber,
+            bodyLength,
+            contentLength: request.headers.get('content-length'),
+          })
+          return new HttpResponse(null, {
+            status: 200,
+            headers: { etag: `"etag-${partNumber}"` },
+          })
+        },
+      ),
+    )
+
+    const createRequest = await signedRequest(
+      `https://cdn.example.com/${key}?uploads=`,
+      { method: 'POST' },
+    )
+    const created = await worker.fetch(createRequest, baseEnv)
+    expect(created.status).toBe(200)
+    expect(await created.text()).toContain(uploadId)
+    expect(createLength === null || createLength === '0').toBe(true)
+
+    for (const [index, part] of [firstPart, lastPart].entries()) {
+      const partNumber = index + 1
+      const request = await signedRequest(
+        `https://cdn.example.com/${key}?partNumber=${partNumber}&uploadId=${uploadId}`,
+        {
+          method: 'PUT',
+          body: part,
+          headers: {
+            'content-length': String(part.byteLength),
+          },
+        },
+      )
+      const response = await worker.fetch(request, baseEnv)
+      expect(response.status).toBe(200)
+      expect(response.headers.get('etag')).toBe(`"etag-${partNumber}"`)
+    }
+
+    const completion = `<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>"etag-1"</ETag></Part><Part><PartNumber>2</PartNumber><ETag>"etag-2"</ETag></Part></CompleteMultipartUpload>`
+    const completeRequest = await signedRequest(
+      `https://cdn.example.com/${key}?uploadId=${uploadId}`,
+      {
+        method: 'POST',
+        body: completion,
+        headers: { 'content-type': 'application/xml' },
+      },
+    )
+    const completed = await worker.fetch(completeRequest, baseEnv)
+    expect(completed.status).toBe(200)
+
+    expect(partRequests).toEqual([
+      {
+        partNumber: '1',
+        bodyLength: firstPart.byteLength,
+        contentLength: String(firstPart.byteLength),
+      },
+      {
+        partNumber: '2',
+        bodyLength: lastPart.byteLength,
+        contentLength: String(lastPart.byteLength),
+      },
+    ])
+    expect(completeLength).toBe(
+      String(new TextEncoder().encode(completion).length),
+    )
+    expect(completeBody).toBe(completion)
+  }, 20000)
 
   it('rejects HTML POST policy uploads without authentication', async () => {
     const response = await worker.fetch(
@@ -373,6 +641,34 @@ describe('Worker proxy', () => {
     })
 
     expect(response.status).toBe(200)
+  })
+
+  it('forwards Content-Length with a restrictive header allowlist', async () => {
+    let receivedBody
+    let receivedLength
+    network.use(
+      http.put(
+        'https://my-bucket.s3.us-west-001.backblazeb2.com/object.bin',
+        async ({ request }) => {
+          receivedBody = await request.text()
+          receivedLength = request.headers.get('content-length')
+          return new HttpResponse(null, { status: 200 })
+        },
+        { once: true },
+      ),
+    )
+    const request = await signedRequest('https://cdn.example.com/object.bin', {
+      method: 'PUT',
+      body: 'body',
+    })
+    const response = await worker.fetch(request, {
+      ...baseEnv,
+      ALLOWED_HEADERS: ['x-unrelated'],
+    })
+
+    expect(response.status).toBe(200)
+    expect(receivedBody).toBe('body')
+    expect(receivedLength).toBe('4')
   })
 
   it('signs a HEAD client request and uses GET upstream', async () => {

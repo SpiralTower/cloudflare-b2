@@ -9,9 +9,10 @@ application key. The Worker verifies that signature, maps the request to the
 B2 S3 hostname, signs it again with the same key, and forwards it to B2.
 
 The Worker supports S3 REST requests for `GET`, `HEAD`, `PUT`, `POST`,
-`DELETE`, and `OPTIONS`, including path-style, host-style, multipart REST,
-and presigned URL requests. HTML POST policy form uploads, AWS streaming
-chunk/trailer signing, SigV4a, and session tokens are not supported.
+`DELETE`, and `OPTIONS`, including path-style, host-style, fixed-length
+uploads, multipart REST, and presigned URL requests. HTML POST policy form
+uploads, AWS streaming chunk/trailer signing, SigV4a, and session tokens are
+not supported.
 
 ## Requirements
 
@@ -45,17 +46,17 @@ RCLONE_DOWNLOAD = "false"
 printf '%s' '<your b2 application key>' | npx wrangler secret put B2_APPLICATION_KEY
 ```
 
-| Variable                     | Default         | Purpose                                                                                                                                                              |
-| ---------------------------- | --------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `B2_APPLICATION_KEY_ID`      | required        | B2 application key ID used to verify and re-sign requests.                                                                                                           |
-| `B2_APPLICATION_KEY`         | required secret | B2 application key.                                                                                                                                                  |
-| `B2_ENDPOINT`                | required        | Standard B2 S3 endpoint, such as `s3.us-west-001.backblazeb2.com`. The region is derived from it. Non-standard endpoints fail closed.                                |
-| `BUCKET_NAME`                | required        | A fixed bucket name, `$path`, or `$host`.                                                                                                                            |
-| `ALLOW_LIST_BUCKET`          | `false`         | Allows bucket listing (`GET` or `HEAD` at the bucket root) after authentication.                                                                                     |
-| `ALLOW_UNSIGNED_READ`        | `false`         | Allows fully unsigned `GET` and `HEAD`, including `Range`. Anonymous writes are always denied.                                                                       |
-| `SIGNATURE_MAX_SKEW_SECONDS` | `900`           | Allowed clock skew for Authorization-header signatures, from `0` to `86400`. Invalid values fall back to `900`. Presigned URLs use stricter issue and expiry checks. |
-| `RCLONE_DOWNLOAD`            | `false`         | Strips the rclone `file/` prefix before forwarding, while verifying the signature against the original CDN URL.                                                      |
-| `ALLOWED_HEADERS`            | unset           | If set, only the listed client headers are forwarded upstream. Header names are case-insensitive.                                                                    |
+| Variable                     | Default         | Purpose                                                                                                                                                                    |
+| ---------------------------- | --------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `B2_APPLICATION_KEY_ID`      | required        | B2 application key ID used to verify and re-sign requests.                                                                                                                 |
+| `B2_APPLICATION_KEY`         | required secret | B2 application key.                                                                                                                                                        |
+| `B2_ENDPOINT`                | required        | Standard B2 S3 endpoint, such as `s3.us-west-001.backblazeb2.com`. The region is derived from it. Non-standard endpoints fail closed.                                      |
+| `BUCKET_NAME`                | required        | A fixed bucket name, `$path`, or `$host`.                                                                                                                                  |
+| `ALLOW_LIST_BUCKET`          | `false`         | Allows bucket listing (`GET` or `HEAD` at the bucket root) after authentication.                                                                                           |
+| `ALLOW_UNSIGNED_READ`        | `false`         | Allows fully unsigned `GET` and `HEAD`, including `Range`. Anonymous writes are always denied.                                                                             |
+| `SIGNATURE_MAX_SKEW_SECONDS` | `900`           | Allowed clock skew for Authorization-header signatures, from `0` to `86400`. Invalid values fall back to `900`. Presigned URLs use stricter issue and expiry checks.       |
+| `RCLONE_DOWNLOAD`            | `false`         | Strips the rclone `file/` prefix before forwarding, while verifying the signature against the original CDN URL.                                                            |
+| `ALLOWED_HEADERS`            | unset           | If set, only the listed client headers are forwarded upstream. `Content-Length` is handled separately to preserve fixed-length uploads. Header names are case-insensitive. |
 
 `ALLOW_LIST_BUCKET` and `ALLOW_UNSIGNED_READ` are independent. An unsigned
 bucket listing still requires both `ALLOW_UNSIGNED_READ=true` and
@@ -147,7 +148,12 @@ rejected. The Worker re-signs presigned requests with
   CORS policy controls the response.
 - `multipart/form-data` POST policy uploads return `NotImplemented`. Other S3
   REST `POST` operations are forwarded after authentication.
-- Request bodies are streamed from the client without buffering or tee-ing.
+- Requests with `Content-Length` are fully read and checked before forwarding,
+  then sent upstream with the same declared length. A body shorter or longer
+  than the declaration is rejected with `IncompleteBody`; malformed lengths
+  are rejected with `InvalidRequest`.
+- Requests without `Content-Length` are streamed from the client without
+  buffering or tee-ing. AWS streaming SigV4 requests remain unsupported.
 - `x-amz-checksum-*`, `content-md5`, and integrity headers that were signed by
   the client are retained and signed again for B2.
 - `HEAD` is verified as `HEAD` on the CDN URL, re-signed as `GET` upstream,
@@ -164,6 +170,10 @@ headers, hop-by-hop headers, Cloudflare-injected headers, the `cf-*` prefix,
 `if-modified-since`, `if-none-match`, `if-range`, `if-unmodified-since`).
 The Worker also removes the client's old `Authorization`, `Host`, and
 `x-amz-date` before signing the B2 request.
+
+`Content-Length` is restored from the validated request body length and is
+forwarded without being included in the upstream signature. It does not need
+to be listed in `ALLOWED_HEADERS`.
 
 To restrict forwarding further, set a list:
 
@@ -188,6 +198,10 @@ S3 multipart REST operations, including `CreateMultipartUpload`,
 `UploadPart`, `CompleteMultipartUpload`, `AbortMultipartUpload`, and
 `ListParts`, work through the normal signed request flow. HTML POST policy
 uploads do not work.
+
+Use fixed-length uploads with services such as Forgejo's MinIO storage.
+Forgejo must use an HTTPS S3 endpoint (`MINIO_USE_SSL=true`); its HTTP
+endpoint mode uses AWS streaming SigV4, which this Worker rejects.
 
 ## Rclone downloads
 
